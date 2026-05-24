@@ -1,0 +1,47 @@
+# Example: a platform-team-owned PodDebuggerApprovalPolicy (Phase 12).
+#
+# Apply alongside `kubectl apply -f deploy/crd.yaml`. The operator consults
+# every matching PodDebuggerApprovalPolicy when reconciling a PDR (see
+# HLD §17 for the full precedence ladder).
+#
+# This example says: in any namespace labeled `tier=prod`, the operator may
+# auto-restart pods and auto-scale Deployments — but `rollback` is always
+# refused, and `set-resources` requires explicit human approval
+# (spec.approved=true on the PDR).
+apiVersion: aiops.poddebugger.io/v1alpha1
+kind: PodDebuggerApprovalPolicy
+metadata:
+  name: prod-allowlist
+spec:
+  scope:
+    namespaceSelector:
+      matchLabels:
+        tier: prod
+  rules:
+    - kind: remediation
+      action: restart
+      decision: allow
+    - kind: remediation
+      action: scale
+      decision: allow
+    - kind: remediation
+      action: rollback
+      decision: deny
+    - kind: remediation
+      action: set-resources
+      decision: requires-approval
+      # expires: 2026-12-31    # optional ISO date; rule ignored after this day
+---
+# Example #2 — deny everything cluster-wide except where a more specific
+# policy says otherwise. A handy "default-deny" baseline; rule.action left
+# empty means "any remediation action".
+apiVersion: aiops.poddebugger.io/v1alpha1
+kind: PodDebuggerApprovalPolicy
+metadata:
+  name: cluster-default-deny
+spec:
+  # No scope.namespaceSelector → matches every namespace.
+  rules:
+    - kind: remediation
+      action: ""             # empty = match every action
+      decision: requires-approval

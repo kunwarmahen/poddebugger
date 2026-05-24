@@ -1,0 +1,52 @@
+# The PodDebugger operator Deployment. It runs `poddebugger-watch --operator`,
+# which reconciles PodDiagnosticRequest custom resources.
+#
+# Prereqs: apply crd.yaml and rbac.yaml first, and create the LLM-key Secret:
+#   kubectl -n poddebugger create secret generic poddebugger-llm \
+#     --from-literal=api-key=sk-ant-...
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: poddebugger-operator
+  namespace: poddebugger
+  labels:
+    app: poddebugger-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: poddebugger-operator
+  template:
+    metadata:
+      labels:
+        app: poddebugger-operator
+    spec:
+      serviceAccountName: poddebugger-operator
+      containers:
+        - name: operator
+          # Build with: docker build -f deploy/Dockerfile -t poddebugger-operator:latest .
+          image: poddebugger-operator:latest
+          args: ["--operator"]
+          env:
+            - name: PODDEBUGGER_LLM_PROVIDER
+              value: anthropic
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: poddebugger-llm
+                  key: api-key
+                  optional: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault

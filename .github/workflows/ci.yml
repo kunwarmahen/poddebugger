@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  agent:
+    name: Python agent
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Byte-compile
+        run: python -m compileall agent/poddebugger
+      - name: Unit tests
+        run: python -m unittest discover -v
+        working-directory: agent
+
+  controller:
+    name: Go controller
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+        working-directory: controller
+      - name: Build
+        run: go build ./...
+        working-directory: controller
+      - name: Vet
+        run: go vet ./...
+        working-directory: controller
+      - name: Test
+        run: go test ./...
+        working-directory: controller

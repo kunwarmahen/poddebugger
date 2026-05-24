@@ -1,0 +1,60 @@
+# Namespace, ServiceAccount and least-privilege RBAC for the PodDebugger
+# operator. The operator only reads workload state and (for remediation)
+# deletes pods — it never needs privileged or host access, so the default
+# OpenShift `restricted-v2` SCC is sufficient (no custom SCC required).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: poddebugger
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: poddebugger-operator
+  namespace: poddebugger
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: poddebugger-operator
+rules:
+  # Read workload state for diagnosis.
+  - apiGroups: [""]
+    resources: [pods, pods/log, events, namespaces]
+    verbs: [get, list, watch]
+  # Deep inspection runs read-only probes via exec.
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create]
+  # Remediation: `restart` deletes the pod so its controller recreates it.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [delete]
+  # Owner lookups for richer remediation (future).
+  - apiGroups: [apps]
+    resources: [deployments, replicasets, statefulsets]
+    verbs: [get, list]
+  # The operator's own custom resource.
+  - apiGroups: [aiops.poddebugger.io]
+    resources: [poddiagnosticrequests]
+    verbs: [get, list, watch, update, patch]
+  - apiGroups: [aiops.poddebugger.io]
+    resources: [poddiagnosticrequests/status]
+    verbs: [get, update, patch]
+  # Phase 12 — cluster-wide approval policies (read-only).
+  - apiGroups: [aiops.poddebugger.io]
+    resources: [poddebuggerapprovalpolicies]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: poddebugger-operator
+subjects:
+  - kind: ServiceAccount
+    name: poddebugger-operator
+    namespace: poddebugger
+roleRef:
+  kind: ClusterRole
+  name: poddebugger-operator
+  apiGroup: rbac.authorization.k8s.io

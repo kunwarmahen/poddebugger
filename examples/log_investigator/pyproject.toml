@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "log-investigator"
+version = "0.1.0"
+description = "Tiny inquiro reference app — investigates a log file"
+requires-python = ">=3.10"
+dependencies = [
+    "inquiro>=0.1.0",
+]
+
+[project.scripts]
+log-investigator = "log_investigator.cli:main"
+
+[tool.setuptools]
+packages = ["log_investigator", "log_investigator.agents"]

@@ -1,0 +1,290 @@
+# PodDiagnosticRequest — the declarative, auditable way to ask PodDebugger to
+# diagnose (and optionally remediate) a pod. Create one of these and the
+# operator fills in .status with the root-cause analysis.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: poddiagnosticrequests.aiops.poddebugger.io
+spec:
+  group: aiops.poddebugger.io
+  scope: Namespaced
+  names:
+    kind: PodDiagnosticRequest
+    plural: poddiagnosticrequests
+    singular: poddiagnosticrequest
+    shortNames:
+      - pdr
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Pod
+          type: string
+          jsonPath: .spec.podName
+        - name: Mode
+          type: string
+          jsonPath: .spec.remediationMode
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Confidence
+          type: number
+          jsonPath: .status.confidence
+        - name: Proposed
+          type: string
+          jsonPath: .status.proposedRemediation.action
+        - name: Risk
+          type: string
+          jsonPath: .status.proposedRemediation.risk
+        - name: Outcome
+          type: string
+          jsonPath: .status.remediation.verification.outcome
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [podName]
+              properties:
+                podName:
+                  type: string
+                  description: Name of the pod to diagnose.
+                namespace:
+                  type: string
+                  description: Pod namespace. Defaults to the request's namespace.
+                container:
+                  type: string
+                  description: Specific container to focus on (optional).
+                deep:
+                  type: boolean
+                  default: false
+                  description: Run deep inspection (read-only probes inside the pod).
+                remediationMode:
+                  type: string
+                  enum: [SuggestOnly, ApproveRequired, AutoRemediate]
+                  default: SuggestOnly
+                  description: >-
+                    SuggestOnly diagnoses only; ApproveRequired waits for
+                    spec.approved=true; AutoRemediate acts immediately.
+                remediationAction:
+                  type: string
+                  enum: [restart, scale, set-resources, adjust-probe, rollback]
+                  description: >-
+                    Optional manual override of the catalog action to apply.
+                    When empty (default), the operator uses the Remediator
+                    agent's validated proposal from .status.proposedRemediation.
+                remediationParams:
+                  type: object
+                  additionalProperties:
+                    type: string
+                  description: >-
+                    Parameters for remediationAction as string key/value pairs
+                    (the catalog coerces e.g. replicas="3" -> 3). Ignored when
+                    remediationAction is empty (the proposal's params are used).
+                maxAutoRisk:
+                  type: string
+                  enum: [low, medium]
+                  default: low
+                  description: >-
+                    Under AutoRemediate, only auto-apply actions at or below
+                    this risk tier (HLD §12.5). Higher-risk proposals fall
+                    back to AwaitingApproval — a human must approve them.
+                allowedActions:
+                  type: array
+                  items:
+                    type: string
+                    enum: [restart, scale, set-resources, adjust-probe, rollback]
+                  description: >-
+                    Optional whitelist of catalog actions the operator may
+                    apply for this request. When empty, all catalog actions
+                    are allowed (subject to maxAutoRisk).
+                approved:
+                  type: boolean
+                  default: false
+                  description: >-
+                    Set true to authorize remediation under ApproveRequired.
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  description: >-
+                    Pending | Complete | AwaitingApproval | Remediated | Failed
+                summary:
+                  type: string
+                rootCause:
+                  type: string
+                confidence:
+                  type: number
+                suggestedFixes:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      action:
+                        type: string
+                      rationale:
+                        type: string
+                      risk:
+                        type: string
+                proposedRemediation:
+                  type: object
+                  description: >-
+                    The Remediator agent's validated proposal (HLD §12.3),
+                    populated before any execution so a human reviewing an
+                    ApproveRequired request sees exactly what will happen.
+                  properties:
+                    action:
+                      type: string
+                      description: Catalog action name, or "none" if no action fits.
+                    params:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    risk:
+                      type: string
+                    rationale:
+                      type: string
+                    expectedEffect:
+                      type: string
+                    confidence:
+                      type: number
+                    validated:
+                      type: boolean
+                      description: True if the proposal passed catalog validation.
+                    reason:
+                      type: string
+                      description: When action="none", why no catalog action fits.
+                    validationError:
+                      type: string
+                      description: When validation rejected the proposal, the error message.
+                    reversal:
+                      type: object
+                      description: >-
+                        The {action,params} a future `remediate --undo` (Phase
+                        7D) will replay to revert this action.
+                      x-kubernetes-preserve-unknown-fields: true
+                remediation:
+                  type: object
+                  properties:
+                    action:
+                      type: string
+                    executed:
+                      type: boolean
+                    result:
+                      type: string
+                    verification:
+                      type: object
+                      description: >-
+                        Phase 7D: post-remediation re-check of the workload
+                        (HLD §12.7).
+                      properties:
+                        outcome:
+                          type: string
+                          description: recovered | still-failing | unknown | skipped
+                        reason:
+                          type: string
+                        waitedSeconds:
+                          type: integer
+                observedTime:
+                  type: string
+                message:
+                  type: string
+---
+# PodDebuggerApprovalPolicy — cluster-scoped overlay that lets a platform
+# admin pre-approve (or refuse) catalog actions across many
+# PodDiagnosticRequests at once. The operator equivalent of Phase 11's
+# `~/.config/poddebugger/approvals.json` rules file. See HLD §17 for the
+# precedence ladder (spec.allowedActions on the CR wins; then matching
+# policies; then the CR's spec.remediationMode default behavior).
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: poddebuggerapprovalpolicies.aiops.poddebugger.io
+spec:
+  group: aiops.poddebugger.io
+  scope: Cluster
+  names:
+    kind: PodDebuggerApprovalPolicy
+    plural: poddebuggerapprovalpolicies
+    singular: poddebuggerapprovalpolicy
+    shortNames:
+      - pdap
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Rules
+          type: integer
+          jsonPath: .spec.rulesCount
+          description: number of rules (cosmetic — populated by docs only)
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [rules]
+              properties:
+                scope:
+                  type: object
+                  description: >-
+                    Which PodDiagnosticRequests this policy applies to. When
+                    omitted (or empty), the policy applies cluster-wide.
+                  properties:
+                    namespaceSelector:
+                      type: object
+                      description: >-
+                        Match PDRs whose target namespace carries these
+                        labels. Empty selector = match every namespace.
+                      properties:
+                        matchLabels:
+                          type: object
+                          additionalProperties:
+                            type: string
+                rules:
+                  type: array
+                  description: >-
+                    Ordered list of policy rules. The first matching rule's
+                    decision wins, except `deny` always wins over `allow`
+                    when both match the same descriptor.
+                  items:
+                    type: object
+                    required: [kind, action, decision]
+                    properties:
+                      kind:
+                        type: string
+                        enum: [remediation]
+                        description: >-
+                          Phase 12 only gates remediation actions. Probes
+                          are CLI-only (Phase 11 RulesGate).
+                      action:
+                        type: string
+                        enum: [restart, scale, set-resources, adjust-probe, rollback]
+                      decision:
+                        type: string
+                        enum: [allow, deny, requires-approval]
+                        description: >-
+                          `allow` = auto-apply OK under AutoRemediate.
+                          `deny` = refuse always. `requires-approval` =
+                          downgrade AutoRemediate to ApproveRequired for
+                          this action (waits for spec.approved=true).
+                      expires:
+                        type: string
+                        format: date
+                        description: >-
+                          Optional ISO date (YYYY-MM-DD). The rule is
+                          ignored after this day.

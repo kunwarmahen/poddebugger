@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poddebugger"
+version = "0.1.0"
+description = "AI agent that troubleshoots failing pods/containers (Podman + Kubernetes/OpenShift)"
+requires-python = ">=3.10"
+dependencies = [
+    "inquiro>=0.1.0",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.40"]
+search = ["ddgs>=8.0"]
+all = ["anthropic>=0.40", "openai>=1.40", "ddgs>=8.0"]
+
+[project.scripts]
+poddebugger = "poddebugger.cli:main"
+
+[tool.setuptools]
+packages = [
+    "poddebugger",
+    "poddebugger.providers",
+    "poddebugger.llm",
+    "poddebugger.framework",
+    "poddebugger.scaffold",
+    "poddebugger.scaffold.agents",
+]

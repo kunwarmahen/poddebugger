@@ -1,0 +1,634 @@
+"""Investigation engine — the core agent loop (HLD §11, Stage 9B).
+
+Orchestrates a registry of agents — built-ins from
+:mod:`poddebugger.scaffold.agents` plus any user-supplied extras — over a
+shared :class:`InvestigationState`. Each agent is a fresh-context
+``complete()`` call returning JSON; the engine builds the per-call
+``AgentContext``, runs the call (with the per-role LLM and the retry/degrade
+layer), and lets the agent's ``apply()`` mutate the state.
+
+The output is a plain :class:`~poddebugger.models.Diagnosis` — the existing
+contract — so the CLI, watcher, and operator are unchanged.
+
+Resilience: no single agent can derail the run. A failed call is retried,
+then degraded — the engine carries on. The Reporter has a deterministic
+fallback if it cannot speak.
+"""
+
+from __future__ import annotations
+
+import importlib
+import os
+import sys
+from typing import Iterable
+
+from .. import remediation
+from ..analyzer import _extract_json, _to_diagnosis
+from ..collector import collect
+from ..llm.base import LLMClient, LLMError
+from ..models import Diagnosis, Fix, WorkloadRef
+from ..providers.base import ContainerPlatform, ProviderError
+from .agents import (
+    ActionAgent,
+    Agent,
+    AgentContext,
+    Librarian,
+    Remediator,
+    built_in_agents,
+)
+from .llms import AgentLLMs
+from .probes import PROBE_MENU, run_probe
+from .search import NoopBackend, SearchBackend, SearchError, get_backend, redact_query
+from .state import Finding, Hypothesis, InvestigationState
+from .workspace import Workspace
+
+_PROBE_NAMES = {p.name for p in PROBE_MENU}
+
+DEFAULT_MAX_ITERATIONS = 10
+DEFAULT_MAX_LLM_CALLS = 48
+_PROBE_OUTPUT_CAP = 6000  # chars of probe output recorded as evidence
+# Once a finding explains the failure, allow only this many more iterations.
+_EXTRA_ITERS_AFTER_FINDING = 2
+
+
+def _clamp(value) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def load_agents_from_env(var: str = "PODDEBUGGER_EXTRA_AGENTS") -> list[Agent]:
+    """Import and instantiate the agents listed in a comma-separated env var.
+
+    Each entry is a dotted Python path (``mypkg.module.MyAgent``). A path that
+    fails to import or instantiate is skipped with a warning on stderr — one
+    misconfigured plugin must not block the rest of the run.
+    """
+    raw = os.environ.get(var, "").strip()
+    if not raw:
+        return []
+    loaded: list[Agent] = []
+    for path in (p.strip() for p in raw.split(",") if p.strip()):
+        module_name, _, attr = path.rpartition(".")
+        if not module_name or not attr:
+            print(f"[scaffold] skipping bad agent path {path!r}", file=sys.stderr)
+            continue
+        try:
+            mod = importlib.import_module(module_name)
+            cls = getattr(mod, attr)
+            instance = cls()
+        except Exception as exc:  # noqa: BLE001 — third-party agents may raise anything
+            print(f"[scaffold] could not load agent {path!r}: {exc}", file=sys.stderr)
+            continue
+        if not isinstance(instance, Agent):
+            print(
+                f"[scaffold] {path!r} is not an Agent subclass — skipping",
+                file=sys.stderr,
+            )
+            continue
+        loaded.append(instance)
+    return loaded
+
+
+class InvestigationEngine:
+    """Runs one investigation: collect -> scout -> plan -> loop -> audit -> report."""
+
+    def __init__(
+        self,
+        provider: ContainerPlatform,
+        llm: LLMClient | AgentLLMs,
+        *,
+        max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        max_llm_calls: int = DEFAULT_MAX_LLM_CALLS,
+        log_lines: int = 200,
+        workspace_base=None,
+        verbose: bool = False,
+        extra_agents: Iterable[Agent] | None = None,
+        remediation_enabled: bool = False,
+        research_enabled: bool = False,
+        search_backend: SearchBackend | None = None,
+        gate=None,
+    ):
+        self.provider = provider
+        # Accept either a single client (all roles) or a per-role resolver.
+        self.llms = llm if isinstance(llm, AgentLLMs) else AgentLLMs.uniform(llm)
+        self.max_iterations = max_iterations
+        self.max_llm_calls = max_llm_calls
+        self.log_lines = log_lines
+        self.workspace_base = workspace_base
+        self.verbose = verbose
+        self.remediation_enabled = remediation_enabled
+        self.research_enabled = research_enabled
+        # The Librarian formulates queries; this backend runs them. Default
+        # noop keeps the engine air-gap safe (HLD §13.3).
+        self.search_backend: SearchBackend = (
+            search_backend if search_backend is not None else NoopBackend()
+        )
+        # Phase 11: the approval gate for any side-effecting probe (and any
+        # mutation, if a future engine path needs it). Defaults to None —
+        # `_do_probe` then runs probes without a gate, preserving legacy
+        # test behavior. The CLI always supplies one.
+        self.gate = gate
+
+        # Agent registry: built-ins first, then `extra_agents`, then env-loaded.
+        # Later registrations win on name conflict — callers can replace
+        # a built-in by registering another agent with the same name.
+        self._agents: dict[str, Agent] = {}
+        self._action_agents: dict[str, ActionAgent] = {}
+        for agent in built_in_agents():
+            self._register(agent)
+        # The Remediator is opt-in (Phase 7B). It is never reachable from the
+        # Coordinator loop — the engine invokes it explicitly via
+        # ``propose_remediation`` after the verdict.
+        if remediation_enabled:
+            self._register(Remediator())
+        # The Librarian is also opt-in (Phase 8). When enabled, it IS
+        # Coordinator-dispatchable as the ``research`` action.
+        if research_enabled:
+            self._register(Librarian())
+        for agent in (extra_agents or ()):
+            self._register(agent)
+        for agent in load_agents_from_env():
+            self._register(agent)
+
+        # populated during a run
+        self.state: InvestigationState | None = None
+        self.workspace: Workspace | None = None
+        self._calls = 0
+        self._ref: WorkloadRef | None = None
+        self._probes_run: set[str] = set()
+        self._queries_run: set[str] = set()
+
+    # --- registry -----------------------------------------------------------
+
+    def _register(self, agent: Agent) -> None:
+        """Add an agent to the registry. Later registrations win on name."""
+        self._agents[agent.name] = agent
+        if isinstance(agent, ActionAgent):
+            self._action_agents[agent.action_name] = agent
+
+    def _action_menu(self) -> list[tuple[str, str]]:
+        """The Coordinator's dynamic action menu — every registered
+        ActionAgent contributes one ``(action_name, description)`` entry."""
+        return [(a.action_name, a.description) for a in self._action_agents.values()]
+
+    # --- helpers ------------------------------------------------------------
+
+    def _log(self, message: str) -> None:
+        if self.verbose:
+            print(f"[scaffold] {message}", file=sys.stderr)
+
+    def _budget_ok(self) -> bool:
+        return self._calls < self.max_llm_calls
+
+    def _call(self, role: str, system: str, user: str, attempts: int = 2) -> dict:
+        """One agent turn: complete() + JSON parse, retrying transient failures.
+
+        Uses the LLM configured for ``role`` (per-agent override or default).
+        Raises LLMError only if every attempt fails (caught by ``_try_call``).
+        """
+        llm = self.llms.for_role(role)
+        last: LLMError | None = None
+        for i in range(attempts):
+            nudge = "" if i == 0 else "\n\nReturn ONLY a valid JSON object — no prose."
+            try:
+                raw = llm.complete(system, user + nudge)
+            except LLMError as exc:
+                last = exc
+                self._calls += 1
+                continue
+            self._calls += 1
+            try:
+                return _extract_json(raw)
+            except LLMError as exc:
+                last = exc
+        raise last  # type: ignore[misc]
+
+    def _try_call(self, system: str, user: str, label: str) -> dict | None:
+        """``_call`` that degrades to None instead of raising."""
+        try:
+            return self._call(label, system, user)
+        except LLMError as exc:
+            if self.state is not None:
+                self.state.notes.append(f"{label} agent failed: {exc}")
+            self._log(f"{label}: FAILED — {exc}")
+            return None
+
+    def _commit(self, message: str) -> None:
+        if self.workspace and self.state:
+            self.workspace.commit(self.state, message)
+
+    # --- generic agent dispatch --------------------------------------------
+
+    def _make_context(self, ctx, *, subject=None, instruction="", extras=None) -> AgentContext:
+        return AgentContext(
+            provider=self.provider, ref=self._ref, state=self.state, ctx=ctx,
+            llm=self.llms.for_role("default"),  # overridden below; here only for typing
+            subject=subject, instruction=instruction, extras=extras or {},
+        )
+
+    def _run(self, agent_name: str, ctx, *, subject=None, instruction="", extras=None):
+        """Dispatch one agent. Returns the agent's apply() result or None
+        if the call ultimately failed (the agent never gets to mutate state)."""
+        agent = self._agents.get(agent_name)
+        if agent is None:
+            raise KeyError(f"no agent registered with name {agent_name!r}")
+        ac = AgentContext(
+            provider=self.provider, ref=self._ref, state=self.state, ctx=ctx,
+            llm=self.llms.for_role(agent.name),
+            subject=subject, instruction=instruction, extras=extras or {},
+        )
+        user = agent.build_user_prompt(ac)
+        data = self._try_call(agent.system_prompt, user, agent.name)
+        if data is None:
+            return None
+        return agent.apply(ac, data)
+
+    # --- specialized control flow ------------------------------------------
+
+    def _verify(self, ctx, hyp: Hypothesis, allow_probe: bool = True) -> None:
+        """Per-hypothesis verification, with one grounded re-verify on probe."""
+        result = self._run("Verifier", ctx, subject=hyp)
+        if result is None:
+            hyp.status = "inconclusive"
+            return
+        verdict = result["verdict"]
+        hyp.confidence = _clamp(result["confidence"])
+        hyp.verdict_note = result["note"]
+
+        if verdict == "VERIFIED":
+            hyp.status = "verified"
+            self.state.promote(hyp.id)
+            self.state.record_dispatch("Verifier", "VERIFIED", hyp.id)
+            self._log(f"verifier: {hyp.id} VERIFIED")
+            return
+        if verdict == "REFUTED":
+            hyp.status = "refuted"
+            self.state.refute(hyp.id, hyp.verdict_note)
+            self.state.record_dispatch("Verifier", "REFUTED", hyp.id)
+            self._log(f"verifier: {hyp.id} REFUTED")
+            return
+
+        hyp.status = "inconclusive"
+        self.state.record_dispatch("Verifier", "INCONCLUSIVE", hyp.id)
+        self._log(f"verifier: {hyp.id} INCONCLUSIVE")
+
+        probe = result["suggested_probe"]
+        if allow_probe and probe in _PROBE_NAMES and self._budget_ok():
+            self._do_probe(probe, f"settle {hyp.id}")
+            self._verify(ctx, hyp, allow_probe=False)
+
+    def _do_probe(self, probe_name: str, goal: str) -> None:
+        """Run a whitelisted probe — dedup, capture as Evidence, log."""
+        if probe_name in self._probes_run:
+            self.state.record_dispatch("Prober", probe_name, "skipped — already run")
+            self._log(f"prober: {probe_name} already run, skipped")
+            return
+        self._probes_run.add(probe_name)
+        try:
+            output = run_probe(probe_name, self.provider, self._ref, gate=self.gate)
+        except ProviderError as exc:
+            self.state.add_evidence(f"probe '{probe_name}' could not run",
+                                    detail=str(exc), source=f"prober:{probe_name}")
+            self.state.record_dispatch("Prober", probe_name, f"failed: {exc}")
+            self._log(f"prober: {probe_name} failed — {exc}")
+            return
+        self.state.add_evidence(f"probe '{probe_name}' result — {goal}",
+                                detail=output[:_PROBE_OUTPUT_CAP],
+                                source=f"prober:{probe_name}")
+        self.state.record_dispatch("Prober", probe_name, goal)
+        self._log(f"prober: ran {probe_name}")
+
+    def _dispatch_action(self, action: str, ctx, target: str, instruction: str) -> None:
+        """Route a Coordinator-chosen action to its ActionAgent and any
+        engine-level follow-up (per-hypothesis verify, probe execution)."""
+        if action == "analyze":
+            new_hyps = self._run("Analyst", ctx, instruction=instruction) or []
+            self._log(f"analyst: {len(new_hyps)} new hypotheses")
+            for hyp in new_hyps:
+                if self._budget_ok():
+                    self._verify(ctx, hyp)
+            lead = next((l for l in self.state.leads if l.id == target), None)
+            if lead:
+                lead.status = "pursued"
+            return
+
+        if action == "probe":
+            probe_name = self._run("Prober", ctx, instruction=instruction)
+            if not probe_name:
+                return
+            if probe_name not in _PROBE_NAMES:
+                self.state.notes.append(f"Prober chose an unknown probe: {probe_name!r}")
+                self.state.record_dispatch("Prober", "invalid", probe_name)
+                return
+            self._do_probe(probe_name, instruction or "gather evidence")
+            return
+
+        if action == "research" and "Librarian" in self._agents:
+            self._do_research(ctx, instruction)
+            return
+
+        # Any other registered ActionAgent: dispatch generically. Its apply()
+        # is responsible for recording evidence / dispatch records itself.
+        if action in self._action_agents:
+            self._run(self._action_agents[action].name, ctx, instruction=instruction)
+
+    def _do_research(self, ctx, instruction: str) -> None:
+        """Run the Librarian, redact its query, hit the backend, record hits.
+
+        Modeled on _do_probe (HLD §13.1): the LLM picks WHAT to search for;
+        the engine does the actual network call so the safety boundary —
+        :func:`search.redact_query` — applies in exactly one place.
+        """
+        proposal = self._run("Librarian", ctx, instruction=instruction)
+        if not proposal or not isinstance(proposal, dict):
+            return
+        query = (proposal.get("query") or "").strip()
+        if not query:
+            reason = proposal.get("reason") or "Librarian declined to search"
+            self.state.record_dispatch("Librarian", "skip", reason[:80])
+            self._log(f"librarian: skipped — {reason}")
+            return
+        redacted = redact_query(query)
+        if not redacted:
+            self.state.record_dispatch("Librarian", "skip",
+                                       "redacted query was empty")
+            return
+        # Skip duplicate queries — same as the probe dedup.
+        if redacted in self._queries_run:
+            self.state.record_dispatch("Librarian", redacted,
+                                       "skipped — already searched")
+            self._log(f"librarian: {redacted!r} already run, skipped")
+            return
+        self._queries_run.add(redacted)
+
+        if isinstance(self.search_backend, NoopBackend):
+            self.state.notes.append(
+                "research requested but PODDEBUGGER_SEARCH_BACKEND is unset — "
+                "configure a backend (e.g. duckduckgo) to enable web search"
+            )
+            self.state.record_dispatch("Librarian", redacted, "noop backend")
+            self._log("librarian: noop backend, no results")
+            return
+
+        try:
+            hits = self.search_backend.search(redacted, max_results=5)
+        except SearchError as exc:
+            self.state.add_evidence(
+                f"web search for {redacted!r} could not run",
+                detail=str(exc), source="librarian:error",
+            )
+            self.state.record_dispatch("Librarian", redacted, f"failed: {exc}")
+            self._log(f"librarian: search failed — {exc}")
+            return
+
+        if not hits:
+            self.state.record_dispatch("Librarian", redacted, "no results")
+            self._log(f"librarian: {redacted!r} -> 0 results")
+            return
+
+        for hit in hits:
+            summary = f"{hit.title}".strip() or hit.url
+            detail = (hit.snippet + ("\n" + hit.url if hit.url else "")).strip()
+            self.state.add_evidence(
+                summary, detail=detail[:_PROBE_OUTPUT_CAP],
+                source=f"web:{hit.domain()}",
+            )
+        self.state.record_dispatch(
+            "Librarian", redacted, f"{len(hits)} hits — {hits[0].domain()}",
+        )
+        self._log(f"librarian: {redacted!r} -> {len(hits)} hits")
+
+    def _run_audit_chain(self, ctx) -> None:
+        """Auditor sweep, then route each finding-critique to the Adjudicator."""
+        state = self.state
+        if not state.confirmed_findings:
+            return
+        state.phase = "auditing"
+        result = self._run("Auditor", ctx)
+        if result is None:
+            return
+        for crit in result.get("critiques", []) or []:
+            if not isinstance(crit, dict):
+                continue
+            concern = str(crit.get("concern", "")).strip()
+            if not concern:
+                continue
+            target = str(crit.get("target", "")).strip()
+            finding = next((f for f in state.confirmed_findings if f.id == target), None)
+            if finding is None:
+                state.notes.append(f"audit concern ({target or 'strategy'}): {concern}")
+                state.record_dispatch("Auditor", "critique", concern[:80])
+                self._log(f"auditor: critique on {target or 'strategy'}")
+                continue
+            ruling = self._run("Adjudicator", ctx, subject=(finding, concern))
+            if ruling is None:
+                continue
+            if ruling["ruling"] == "uphold":
+                state.demote(finding.id, f"adjudicated: {ruling['reason']}")
+                state.record_dispatch("Adjudicator", "upheld — demoted", finding.id)
+                self._log(f"adjudicator: {finding.id} demoted")
+            else:
+                state.record_dispatch("Adjudicator", "dismissed critique", finding.id)
+                self._log(f"adjudicator: {finding.id} critique dismissed")
+
+    def _fallback_diagnosis(self, state: InvestigationState) -> Diagnosis:
+        """Deterministic Diagnosis built from the state — used when the
+        Reporter agent fails, so the investigation still yields a result."""
+        evidence = [e.summary for e in state.evidence]
+        if state.confirmed_findings:
+            top = max(state.confirmed_findings, key=lambda f: f.confidence)
+            return Diagnosis(
+                summary=top.statement, root_cause=top.statement,
+                confidence=top.confidence, evidence=evidence,
+                suggested_fixes=[], needs_deep_inspection=False,
+            )
+        if state.hypotheses:
+            top = max(state.hypotheses, key=lambda h: h.confidence)
+            return Diagnosis(
+                summary=top.statement, root_cause=top.statement,
+                confidence=round(top.confidence * 0.5, 2), evidence=evidence,
+                suggested_fixes=[], needs_deep_inspection=True,
+            )
+        return Diagnosis(
+            summary="investigation did not reach a conclusion",
+            root_cause=f"{state.classification or 'failure'} — the agents could "
+                       "not confirm a root cause; review the evidence directly",
+            confidence=0.0, evidence=evidence,
+            suggested_fixes=[Fix(action="inspect the workload manually",
+                                 rationale="automated investigation was inconclusive",
+                                 risk="low")],
+            needs_deep_inspection=True,
+        )
+
+    # --- remediation proposal (Phase 7B) ------------------------------------
+
+    def propose_remediation(self, diagnosis: Diagnosis) -> dict | None:
+        """Ask the Remediator to fill a typed catalog form for this diagnosis.
+
+        Returns a dict the CLI / operator stores on
+        :attr:`Diagnosis.proposed_remediation`. Shape:
+
+        * Successful proposal with a validated plan::
+
+              {"action": "<name>", "params": {...}, "risk": "low|medium",
+               "rationale": "...", "expected_effect": "...", "confidence": 0.0,
+               "plan": <Plan-as-dict>, "reversal": {...},
+               "validated": True}
+
+        * ``"action": "none"`` — no catalog action fits (also returned if the
+          model proposes one but it fails catalog validation; ``validation_error``
+          is set in that case so the CLI can show it to a human).
+
+        Returns ``None`` if the Remediator was not registered (``--fix`` not
+        in effect) or its call failed entirely.
+        """
+        if not self.remediation_enabled or "Remediator" not in self._agents:
+            return None
+        if self.state is None or self._ref is None:
+            return None
+        ctx = collect(self.provider, self._ref, log_lines=self.log_lines)
+        extras = {
+            "diagnosis": {
+                "summary": diagnosis.summary,
+                "root_cause": diagnosis.root_cause,
+                "confidence": diagnosis.confidence,
+            },
+            "platform": self._ref.platform,
+        }
+        result = self._run("Remediator", ctx, extras=extras)
+        if not result:
+            return None
+        action = result.get("action", "none")
+        if action == "none":
+            self.state.record_dispatch("Remediator", "none", result.get("reason", ""))
+            self._commit("remediator: no catalog action fits")
+            return result
+
+        # The catalog is the safety boundary — validate before letting any
+        # downstream code treat the proposal as executable.
+        try:
+            cleaned = remediation.parse_params(action, result.get("params") or {})
+            plan = remediation.make_plan(self.provider, self._ref, action, cleaned)
+        except remediation.RemediationError as exc:
+            self.state.notes.append(
+                f"remediator: proposal failed catalog validation: {exc}"
+            )
+            self.state.record_dispatch("Remediator", "rejected", str(exc)[:80])
+            self._commit(f"remediator: proposal rejected ({exc})")
+            return {
+                "action": "none",
+                "reason": "model proposal failed catalog validation",
+                "validation_error": str(exc),
+                "rejected_proposal": result,
+            }
+
+        self.state.record_dispatch(
+            "Remediator", action, f"risk={plan.risk}"
+        )
+        self._commit(f"remediator: proposed {action} ({plan.risk} risk)")
+        from dataclasses import asdict
+
+        return {
+            "action": action,
+            "params": dict(cleaned),
+            "risk": plan.risk,
+            "rationale": result.get("rationale", ""),
+            "expected_effect": result.get("expected_effect", ""),
+            "confidence": result.get("confidence", 0.0),
+            "plan": asdict(plan),
+            "reversal": plan.reversal or None,
+            "validated": True,
+        }
+
+    # --- public entry point -------------------------------------------------
+
+    def investigate(self, ref: WorkloadRef) -> Diagnosis:
+        """Run the full investigation and return a Diagnosis."""
+        self._ref = ref
+        self._calls = 0
+        self._probes_run = set()
+        self._queries_run = set()
+        ctx = collect(self.provider, ref, log_lines=self.log_lines)
+
+        state = InvestigationState(target=str(ref), platform=ref.platform)
+        self.state = state
+        self.workspace = Workspace.create(str(ref), base=self.workspace_base)
+        self._log(f"workspace: {self.workspace.path}")
+        # Surface the action menu so users adding a custom ActionAgent can see
+        # at a glance that it's wired in — even when the Coordinator never
+        # chooses it for this particular failure.
+        menu = self._action_menu()
+        if menu:
+            names = ", ".join(name for name, _ in menu)
+            self._log(f"action agents available: {names}")
+
+        # Scout (pre-loop, with a fallback if the agent itself fails).
+        state.phase = "scouting"
+        if self._run("Scout", ctx) is None:
+            state.classification = "Unknown"
+            state.add_lead("investigate the failure from logs, events and status",
+                           source="fallback")
+        else:
+            self._log(f"scout: {state.classification}, "
+                      f"{len(state.leads)} leads, {len(state.evidence)} evidence")
+        self._commit("scout: classify and seed leads")
+
+        # Planner.
+        if self._run("Planner", ctx) is not None:
+            self._log(f"planner: {len(state.sanity_checks)} sanity checks")
+        self._commit("planner: strategy and sanity checks")
+
+        # The investigation loop.
+        state.phase = "investigating"
+        findings_at: int | None = None
+        while state.iteration < self.max_iterations and self._budget_ok():
+            state.iteration += 1
+            coord_result = self._run(
+                "Coordinator", ctx,
+                extras={
+                    "iterations_left": self.max_iterations - state.iteration,
+                    "actions": self._action_menu(),
+                },
+            )
+            action, target, instruction = (
+                coord_result if coord_result else ("done", "", "")
+            )
+            self._log(f"coordinator: {action} {target}".strip())
+
+            if action == "done":
+                break
+
+            # Structural guard: a probe tests a hypothesis. With none yet,
+            # analyze first — robust even when a small model misorders steps.
+            if action == "probe" and not state.hypotheses and not state.confirmed_findings:
+                self._log("override: probe -> analyze (no hypothesis to test yet)")
+                action = "analyze"
+
+            self._dispatch_action(action, ctx, target, instruction)
+
+            self._commit(f"iteration {state.iteration}: {action}")
+
+            # Early stop: once findings explain the failure, don't let a weak
+            # Coordinator keep probing indefinitely.
+            if state.confirmed_findings and findings_at is None:
+                findings_at = state.iteration
+            if (findings_at is not None
+                    and state.iteration - findings_at >= _EXTRA_ITERS_AFTER_FINDING):
+                self._log("early stop: confirmed findings explain the failure")
+                break
+
+        # Oversight: whole-state review before the verdict (HLD §11.2).
+        if self._budget_ok():
+            self._run_audit_chain(ctx)
+            self._commit("auditor: cross-result review")
+
+        # Reporter (with deterministic fallback).
+        state.phase = "reporting"
+        data = self._run("Reporter", ctx)
+        diagnosis = _to_diagnosis(data) if data is not None else self._fallback_diagnosis(state)
+        state.phase = "done"
+        self._commit(f"reporter: final diagnosis ({self._calls} LLM calls)")
+        self._log(f"done: {self._calls} LLM calls, {state.iteration} iterations")
+        return diagnosis

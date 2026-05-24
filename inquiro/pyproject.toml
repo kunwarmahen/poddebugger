@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inquiro"
+version = "0.1.0"
+description = "Domain-agnostic multi-agent investigation framework"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/anthropics/poddebugger"
+Source = "https://github.com/anthropics/poddebugger/tree/main/inquiro"
+
+[tool.setuptools]
+packages = ["inquiro"]

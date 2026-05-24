@@ -1,0 +1,36 @@
+# Example: ask PodDebugger to diagnose a pod. Apply it, then watch:
+#   kubectl apply -f deploy/example-request.yaml
+#   kubectl get pdr diagnose-foo -o yaml      # .status fills in
+apiVersion: aiops.poddebugger.io/v1alpha1
+kind: PodDiagnosticRequest
+metadata:
+  name: diagnose-foo
+  namespace: poddebugger
+spec:
+  podName: foo-7f8b9d
+  namespace: app-prod
+  deep: false
+  # SuggestOnly  — diagnose only (default, safest)
+  # ApproveRequired — diagnose, then wait for `approved: true` before acting
+  # AutoRemediate — diagnose and immediately apply (subject to maxAutoRisk)
+  remediationMode: SuggestOnly
+
+  # --- Phase 7C: action selection & guardrails ---
+  # remediationAction is OPTIONAL — when empty, the operator applies the
+  # Remediator agent's validated proposal (.status.proposedRemediation).
+  # Set it to override the proposal with an explicit action:
+  #   restart | scale | set-resources | adjust-probe | rollback
+  # remediationAction: scale
+  # remediationParams:
+  #   replicas: "3"
+
+  # Under AutoRemediate, only auto-apply actions at or below this risk tier
+  # (low → restart/scale; medium → set-resources/adjust-probe/rollback).
+  # Higher-risk proposals fall back to AwaitingApproval.
+  maxAutoRisk: low
+
+  # Optional whitelist of catalog actions allowed for this request. Leave
+  # empty to allow all (still subject to maxAutoRisk).
+  # allowedActions: [restart, scale]
+
+  approved: false
