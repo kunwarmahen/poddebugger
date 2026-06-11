@@ -164,6 +164,8 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             research_enabled=bool(args.research),
             search_backend=search_backend,
             gate=analyze_gate,
+            context=_parse_context(args.context),
+            max_remediation_attempts=args.max_attempts,
         )
         diagnosis = engine.investigate(ref)
     except (LLMError, ProviderError) as exc:
@@ -172,34 +174,32 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 1
 
-    # Phase 7B — investigate → propose → (optionally) apply.
-    applied: dict | None = None
+    # Phase 7B/13A — investigate → propose → (optionally) apply, looping
+    # until the workload recovers or the agent gives up.
+    remediation_outcome: dict | None = None
     if args.fix:
         try:
-            proposal = engine.propose_remediation(diagnosis)
+            remediation_outcome = engine.remediate(
+                diagnosis,
+                apply=bool(args.confirm),
+                max_risk=args.max_risk,
+            )
         except LLMError as exc:
             print(f"error: remediator failed: {exc}", file=sys.stderr)
-            proposal = None
-        diagnosis.proposed_remediation = proposal
-        if args.confirm and proposal and proposal.get("validated"):
-            # Phase 11: gate the apply. Printed proposal is informational;
-            # the gate is consent (HLD §16.9). Reuse analyze_gate so a
-            # session-allow on a probe earlier in the run carries over.
-            applied = _apply_proposal(
-                provider, ref, proposal, args.max_risk, gate=analyze_gate,
-            )
+        if remediation_outcome:
+            diagnosis.proposed_remediation = remediation_outcome.get("final_proposal")
 
     if args.json:
         out = _diagnosis_to_dict(diagnosis)
-        if applied is not None:
-            out["applied_remediation"] = applied
+        if remediation_outcome is not None:
+            out["remediation"] = remediation_outcome
         print(json.dumps(out, indent=2))
     else:
         print(_render_diagnosis(diagnosis))
-        if diagnosis.proposed_remediation:
+        if remediation_outcome is not None:
+            print(_render_remediation_outcome(remediation_outcome))
+        elif diagnosis.proposed_remediation:
             print(_render_proposal(diagnosis.proposed_remediation))
-        if applied is not None:
-            print(_render_applied(applied))
         st = engine.state
         print(f"(investigated with {llms.describe()} — "
               f"{st.iteration} iterations, {len(st.confirmed_findings)} findings; "
@@ -207,61 +207,60 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
-def _apply_proposal(provider, ref, proposal: dict, max_risk: str,
-                    *, verify_wait: int = remediation.DEFAULT_VERIFY_WAIT,
-                    gate=None) -> dict:
-    """Execute a validated proposal if its risk tier is allowed (HLD §12.5).
+def _parse_context(items) -> dict:
+    """Turn repeated ``--context KEY=VALUE`` into a dict."""
+    out: dict = {}
+    for kv in items or []:
+        key, sep, value = str(kv).partition("=")
+        if not sep:
+            raise SystemExit(f"error: --context {kv!r} must be KEY=VALUE")
+        out[key.strip()] = value
+    return out
 
-    Phase 7D: also captures a baseline, runs verify_recovery on the same ref
-    after the action, and persists the result so ``remediate --undo`` can
-    revert it.
-    """
-    risk = proposal.get("risk", "medium")
-    ranking = {"low": 0, "medium": 1, "high": 2}
-    if ranking.get(risk, 99) > ranking.get(max_risk, 0):
-        nudge = "medium" if risk == "medium" else "high"
-        return {
-            "executed": False,
-            "skipped": True,
-            "reason": f"risk={risk} exceeds --max-risk={max_risk}; "
-                      f"re-run with --max-risk {nudge} to apply",
-            "action": proposal["action"],
-        }
-    # Rebuild a Plan from the dict (the engine already validated this proposal).
-    try:
-        params = remediation.parse_params(proposal["action"], proposal.get("params") or {})
-        plan = remediation.make_plan(provider, ref, proposal["action"], params)
-    except (remediation.RemediationError, ProviderError) as exc:
-        return {"executed": False, "skipped": True, "reason": str(exc),
-                "action": proposal["action"]}
-    baseline = remediation.capture_baseline(provider, ref) if verify_wait > 0 else {}
-    result = remediation.execute(provider, ref, plan, gate=gate)
-    verification = None
-    if result.executed and verify_wait > 0:
-        verification = remediation.verify_recovery(
-            provider, ref, baseline, plan.action, verify_wait,
-        )
-    saved_path = None
-    if result.executed:
-        saved_path = str(remediation.save_for_undo(ref, {
-            "action": result.action,
-            "executed": True,
-            "result": result.result,
-            "plan": result.plan,
-            "reversal": result.reversal,
-            "target": _ref_to_dict(ref),
-            "verification": verification,
-        }))
-    return {
-        "executed": result.executed,
-        "skipped": False,
-        "action": result.action,
-        "result": result.result,
-        "plan": result.plan,
-        "reversal": result.reversal,
-        "verification": verification,
-        "saved_to": saved_path,
-    }
+
+def _render_remediation_outcome(outcome: dict) -> str:
+    """Render the adaptive-remediation result + attempt trail."""
+    o = outcome.get("outcome", "?")
+    headline = {
+        "resolved": "✓ RESOLVED — the workload recovered after remediation.",
+        "unresolved": "✗ UNRESOLVED — tried the fixes below; none recovered it.",
+        "proposed": "Proposed remediation (not applied — use --confirm):",
+        "refused": "Remediation refused by the approval gate.",
+        "blocked": "Remediation blocked (risk tier / validation).",
+        "needs_context": "Remediation needs values you must supply.",
+        "no_action": "No catalog action fits this failure.",
+    }.get(o, f"Remediation outcome: {o}")
+    lines = ["", headline]
+
+    if o == "needs_context":
+        for item in outcome.get("needs_context", []):
+            lines.append(f"  • {item.get('key')}: {item.get('reason')}")
+        lines.append("  Re-run with --context KEY=VALUE for each, e.g.:")
+        keys = " ".join(f"--context {i.get('key')}=…"
+                        for i in outcome.get("needs_context", []))
+        lines.append(f"    poddebugger analyze … --fix --confirm {keys}")
+        return "\n".join(lines) + "\n"
+
+    fp = outcome.get("final_proposal") or {}
+    if o in ("proposed", "no_action") and fp:
+        lines.append(_render_proposal(fp).rstrip())
+
+    attempts = outcome.get("attempts") or []
+    if attempts:
+        lines.append("")
+        lines.append(f"Attempts ({len(attempts)}):")
+        for i, a in enumerate(attempts, 1):
+            p = a.get("proposal", {})
+            applied = a.get("applied", {})
+            v = (applied.get("verification") or {})
+            status = v.get("outcome") or (
+                "skipped" if applied.get("skipped") else "applied")
+            lines.append(
+                f"  {i}. {p.get('action')} {p.get('params', {})} → {status}")
+            reason = v.get("reason") or applied.get("reason")
+            if reason:
+                lines.append(f"       {reason}")
+    return "\n".join(lines) + "\n"
 
 
 def _render_proposal(p: dict) -> str:
@@ -282,21 +281,6 @@ def _render_proposal(p: dict) -> str:
     if p.get("reversal"):
         lines.append(f"  reversal:        {p['reversal']}")
     lines.append("  (use --confirm to apply; --max-risk medium to allow medium-risk actions)")
-    return "\n".join(lines) + "\n"
-
-
-def _render_applied(a: dict) -> str:
-    if a.get("skipped"):
-        return f"\nRemediation NOT applied: {a.get('reason', '')}\n"
-    status = "executed" if a.get("executed") else "FAILED"
-    lines = [
-        "",
-        f"Remediation [{a.get('action')}] {status}: {a.get('result', '')}",
-    ]
-    if a.get("verification"):
-        lines.append(_render_verification(a["verification"]))
-    if a.get("saved_to"):
-        lines.append(f"(saved for --undo: {a['saved_to']})")
     return "\n".join(lines) + "\n"
 
 
@@ -545,6 +529,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="with --fix --confirm: only auto-apply actions at or below this "
              "risk tier (default: low — restart/scale). `high` is needed for "
              "the opt-in `shell` action.",
+    )
+    a.add_argument(
+        "--context", action="append", metavar="KEY=VALUE",
+        help="supply a value the agent can't infer (db password, image name, "
+             "db name, …). Repeatable. The Remediator uses these in its fix; "
+             "if a fix needs a value you didn't supply it asks for it.",
+    )
+    a.add_argument(
+        "--max-attempts", type=int, default=3, metavar="N",
+        help="with --fix --confirm: how many different fixes to try before "
+             "giving up if the workload keeps failing (default: 3).",
     )
     a.add_argument(
         "--allow-shell",

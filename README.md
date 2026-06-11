@@ -30,9 +30,15 @@ example](examples/log_investigator/) is included).
   `kubectl` / `oc`. The agent core never shells out directly — every
   runtime call goes through a small provider interface.
 - **Typed remediation catalog.** `restart`, `scale`, `set-resources`,
-  `adjust-probe`, `rollback`. The LLM picks an action and proposes
-  parameters; the catalog validates, bounds-checks, dry-runs (old → new),
-  and captures a reversal for one-command undo.
+  `adjust-probe`, `rollback`, `set-env`, `set-image`, `recreate`. The LLM
+  picks an action and proposes parameters; the catalog validates,
+  bounds-checks, dry-runs (old → new), and captures a reversal for
+  one-command undo.
+- **Adaptive remediation.** A fix that doesn't recover the workload
+  becomes evidence; the team replans and the agent tries something
+  different — until it's actually fixed or the agent gives up. When a fix
+  needs a value the agent can't infer (a password, an image name), it
+  asks for it via `--context`.
 - **Human-in-the-loop approvals.** Every mutating step (catalog action
   *or* deep-inspection probe that runs code in the container) is gated
   by an interactive `[Y]es / [A]lways / [P]ersist / [N]o` prompt,
@@ -105,20 +111,47 @@ poddebugger analyze my-broken-container --no-llm
 poddebugger analyze my-broken-container --json
 ```
 
-### Diagnose, then fix
+### Diagnose, then fix — and keep trying until it's fixed
+
+`--fix` doesn't stop at the first attempt. If a fix doesn't recover the
+workload, the failure becomes evidence, the whole team replans, and the
+agent tries something different — up to `--max-attempts` (default 3) —
+until the workload recovers or it honestly gives up.
 
 ```bash
 # Investigate, then ask the Remediator to propose a catalog action.
 # Nothing runs yet — the proposal is printed.
 poddebugger analyze my-broken-container --fix
 
-# Same, plus apply if the proposal is low-risk (restart / scale).
+# Same, plus apply — and loop until recovered (or out of attempts).
 poddebugger analyze my-broken-container --fix --confirm
 
-# Allow medium-risk actions (set-resources / adjust-probe / rollback) too.
+# Allow medium-risk actions (set-resources / set-env / set-image / …) too.
 poddebugger analyze web-7c --platform kubernetes -n prod \
     --fix --confirm --max-risk medium
 ```
+
+Some fixes need a value the agent can't infer — a database password, the
+correct image name, a missing config value. Supply it with `--context`;
+if you don't, the agent tells you exactly what it needs:
+
+```bash
+# The agent reads the logs, sees a missing env var, and uses your value.
+poddebugger analyze mysql-0 --platform podman --fix --confirm \
+    --context MYSQL_ROOT_PASSWORD=secret --context MYSQL_DATABASE=app
+
+# If you omit a value the fix needs, the run ends with, e.g.:
+#   Remediation needs values you must supply.
+#     • MYSQL_ROOT_PASSWORD: the MySQL root password for set-env
+#   Re-run with --context MYSQL_ROOT_PASSWORD=…
+```
+
+The result prints the attempt trail — what was tried, and what each fix's
+recovery check returned (`recovered` / `still-failing` / `unknown`). The
+catalog actions that change a container's definition — `set-env`,
+`set-image`, `recreate` — round out the typed toolbox the agent picks
+from. See [examples/adaptive_remediation_demo.py](examples/adaptive_remediation_demo.py)
+for a runnable walk-through.
 
 ### Apply a catalog action directly
 
@@ -146,6 +179,12 @@ The catalog at a glance:
 | `set-resources` | medium | ✓ | ✓ | `container`, plus `memory_limit?` / `cpu_limit?` / `memory_request?` (K8s) / `cpu_request?` (K8s) |
 | `adjust-probe` | medium | — | ✓ | `container`, `probe` (liveness/readiness/startup), `initial_delay?` / `period?` / `timeout?` / `failure_threshold?` |
 | `rollback` | medium | — | ✓ | `revision?` |
+| `set-env` | medium | ✓ | ✓ | `container`, `env` (object; a null value deletes the key) |
+| `set-image` | medium | ✓ | ✓ | `container`, `image` |
+| `recreate` | high | ✓ | ✓ | `container`, plus any of `image` / `env` / `command` / `args` |
+
+A freeform `shell` action is also available behind `--allow-shell` (see
+[below](#freeform-shell-action-opt-in)).
 
 Every plan computes an `old → new` diff, a reversal payload, and runs a
 post-execution recovery check (`recovered` / `still-failing` / `unknown`

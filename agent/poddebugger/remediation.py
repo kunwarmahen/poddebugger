@@ -719,6 +719,430 @@ def _execute_rollback(provider, ref: WorkloadRef, plan: Plan) -> ActionResult:
     )
 
 
+# --- spec-change actions: set-env / set-image / recreate (Phase 13) ----------
+#
+# These mutate the container's *definition* — environment variables, image,
+# command. On Kubernetes they're clean `kubectl patch` / `kubectl set image`
+# operations on the owning Deployment. On Podman a container's env and image
+# are immutable once created, so the only honest way to change them is to
+# recreate the container — capture its full run spec, remove it, and re-run
+# with the modified field. ``_podman_recreate`` is the shared workhorse.
+
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# registry/name:tag@digest — lenient; we only guard against obvious garbage.
+_IMAGE_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._\-/:@]*[A-Za-z0-9]$"
+)
+
+
+def _parse_env_map(raw_env) -> dict:
+    """Validate an env map: keys must be shell-legal; values are strings.
+
+    A ``null`` value (Python ``None``) marks the key for deletion.
+    """
+    if not isinstance(raw_env, dict) or not raw_env:
+        raise RemediationError("'env' must be a non-empty object of KEY: value")
+    out: dict = {}
+    for key, value in raw_env.items():
+        if not _ENV_KEY_RE.match(str(key)):
+            raise RemediationError(
+                f"invalid env key {key!r} (must match [A-Za-z_][A-Za-z0-9_]*)"
+            )
+        out[str(key)] = None if value is None else str(value)
+    return out
+
+
+def _validate_image(image: str) -> str:
+    image = str(image).strip()
+    if not image or not _IMAGE_RE.match(image):
+        raise RemediationError(f"invalid image reference {image!r}")
+    return image
+
+
+# -- podman: reconstruct a `podman run` from an inspect, with modifications ----
+
+def _podman_run_spec(provider, ref: WorkloadRef) -> dict:
+    """Capture the fields needed to re-create a Podman container."""
+    d = provider._inspect(ref.name)
+    config = d.get("Config", {}) or {}
+    host = d.get("HostConfig", {}) or {}
+    return {
+        "name": ref.name,
+        "image": d.get("ImageName") or d.get("Image", ""),
+        "env": list(config.get("Env", []) or []),       # ["K=V", ...]
+        "entrypoint": config.get("Entrypoint"),
+        "cmd": config.get("Cmd"),
+        "labels": config.get("Labels") or {},
+        "restart_policy": (host.get("RestartPolicy") or {}).get("Name") or "",
+        "network_mode": host.get("NetworkMode") or "",
+    }
+
+
+def _env_list_to_map(env_list: list) -> dict:
+    out: dict = {}
+    for item in env_list or []:
+        key, sep, value = str(item).partition("=")
+        if sep:
+            out[key] = value
+    return out
+
+
+def _merge_env(current: list, changes: dict) -> list:
+    """Apply ``changes`` (KEY -> value | None-to-delete) onto a ``K=V`` list."""
+    merged = _env_list_to_map(current)
+    for key, value in changes.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    return [f"{k}={v}" for k, v in merged.items()]
+
+
+def _podman_recreate(provider, ref: WorkloadRef, spec: dict, new_env: list,
+                     new_image: str) -> ActionResult:
+    """Remove the container and re-run it with the modified env / image.
+
+    Best-effort rebuild: preserves name, restart policy, network mode,
+    entrypoint and command. Ports/volumes are intentionally NOT carried over
+    in this first cut — the catalog warns about that in the action
+    description. A failed re-run leaves the old container removed; the
+    reversal payload records the prior spec so a human (or ``--undo``) can
+    restore it.
+    """
+    args = ["run", "-d", "--name", ref.name]
+    rp = spec.get("restart_policy")
+    if rp and rp != "no":
+        args += ["--restart", rp]
+    net = spec.get("network_mode")
+    if net and net not in ("", "default", "bridge"):
+        args += ["--network", net]
+    for kv in new_env:
+        args += ["-e", kv]
+    for lk, lv in (spec.get("labels") or {}).items():
+        # Skip podman's own bookkeeping labels.
+        if not str(lk).startswith("io.podman") and not str(lk).startswith("PODMAN"):
+            args += ["--label", f"{lk}={lv}"]
+    entrypoint = spec.get("entrypoint")
+    if entrypoint:
+        # entrypoint may be a list; podman wants a single string for --entrypoint
+        args += ["--entrypoint", json.dumps(entrypoint) if isinstance(entrypoint, list) else str(entrypoint)]
+    args += [new_image]
+    cmd = spec.get("cmd")
+    if cmd:
+        args += list(cmd)
+
+    # Remove the old container first (force — it may be running or exited).
+    rm = provider._run(["rm", "-f", ref.name], check=False)
+    if rm.returncode != 0:
+        return None, _clean(rm.stderr) or "could not remove the old container"
+
+    run = provider._run(args, check=False)
+    if run.returncode != 0:
+        return None, (run.stderr or run.stdout).strip() or "podman run failed"
+    return run, None
+
+
+# -- set-env ------------------------------------------------------------------
+
+def _parse_set_env(raw: dict) -> dict:
+    if "container" not in raw or not str(raw["container"]).strip():
+        raise RemediationError("'set-env' requires 'container'")
+    env = _parse_env_map(raw.get("env"))
+    extra = set(raw) - {"container", "env"}
+    if extra:
+        raise RemediationError(f"'set-env' got unexpected params: {sorted(extra)}")
+    return {"container": str(raw["container"]).strip(), "env": env}
+
+
+def _plan_set_env(provider, ref: WorkloadRef, params: dict) -> Plan:
+    changes = params["env"]
+    summary_bits = ", ".join(
+        f"{k}=<unset>" if v is None else f"{k}={'***' if _looks_secret(k) else v}"
+        for k, v in changes.items()
+    )
+    if provider.name == "podman":
+        spec = _podman_run_spec(provider, ref)
+        old_env = _env_list_to_map(spec["env"])
+        old_relevant = {k: old_env.get(k) for k in changes}
+        return Plan(
+            action="set-env", risk="medium", params=params,
+            target=f"container {ref.name}",
+            summary=f"set env on {ref.name}: {summary_bits} (recreates the container)",
+            old={"env": old_relevant}, new={"env": {k: v for k, v in changes.items()}},
+            reversal=_set_env_reversal(params["container"], old_env, changes),
+        )
+    # Kubernetes — patch the Deployment.
+    _check_namespace(ref)
+    controller = _resolve_controller(provider, ref)
+    current = _kubectl_json(
+        provider, ["get", controller["kind"].lower(), controller["name"],
+                   "-n", controller["namespace"], "-o", "json"])
+    container_name = params["container"]
+    c = _k8s_container(current, container_name)
+    old_env = {e.get("name"): e.get("value") for e in (c.get("env") or [])
+               if isinstance(e, dict)}
+    old_relevant = {k: old_env.get(k) for k in changes}
+    target = f"{controller['kind'].lower()}/{controller['name']}/{container_name}"
+    return Plan(
+        action="set-env", risk="medium", params=params,
+        target=f"{target} (ns={controller['namespace']})",
+        summary=f"set env on {target}: {summary_bits}",
+        old={"env": old_relevant}, new={"env": {k: v for k, v in changes.items()}},
+        reversal=_set_env_reversal(container_name, old_env, changes),
+    )
+
+
+def _set_env_reversal(container: str, old_env: dict, changes: dict) -> dict:
+    """The set-env that restores the keys we're about to change.
+
+    A key that didn't exist before is reversed by deleting it (null value).
+    """
+    restore: dict = {}
+    for key in changes:
+        prior = old_env.get(key)
+        restore[key] = prior  # None if it didn't exist -> delete on undo
+    return {"action": "set-env",
+            "params": {"container": container, "env": restore}}
+
+
+def _execute_set_env(provider, ref: WorkloadRef, plan: Plan) -> ActionResult:
+    changes = plan.params["env"]
+    if provider.name == "podman":
+        spec = _podman_run_spec(provider, ref)
+        new_env = _merge_env(spec["env"], changes)
+        run, err = _podman_recreate(provider, ref, spec, new_env, spec["image"])
+        if run is None:
+            return ActionResult("set-env", False, err,
+                                plan=asdict(plan), reversal=plan.reversal)
+        return ActionResult("set-env", True,
+                            f"container {ref.name} recreated with updated env",
+                            plan=asdict(plan), reversal=plan.reversal)
+    # Kubernetes — strategic-merge patch the named env entries.
+    controller = _resolve_controller(provider, ref)
+    env_entries = []
+    for key, value in changes.items():
+        if value is None:
+            continue  # strategic merge can't delete by patch; skip (set to "" instead)
+        env_entries.append({"name": key, "value": value})
+    deletions = [k for k, v in changes.items() if v is None]
+    patch = {"spec": {"template": {"spec": {"containers": [
+        {"name": plan.params["container"], "env": env_entries}
+    ]}}}}
+    proc = provider._run([
+        "patch", controller["kind"].lower(), controller["name"],
+        "-n", controller["namespace"], "--type=strategic",
+        "-p", json.dumps(patch),
+    ], check=False)
+    if proc.returncode != 0:
+        return ActionResult("set-env", False, _clean(proc.stderr) or "patch failed",
+                            plan=asdict(plan), reversal=plan.reversal)
+    msg = f"{controller['kind'].lower()}/{controller['name']} env updated"
+    if deletions:
+        msg += f" (note: deletions {deletions} need a manual remove on k8s)"
+    return ActionResult("set-env", True, msg,
+                        plan=asdict(plan), reversal=plan.reversal)
+
+
+# -- set-image ----------------------------------------------------------------
+
+def _parse_set_image(raw: dict) -> dict:
+    if "container" not in raw or not str(raw["container"]).strip():
+        raise RemediationError("'set-image' requires 'container'")
+    if "image" not in raw or not str(raw["image"]).strip():
+        raise RemediationError("'set-image' requires 'image'")
+    image = _validate_image(raw["image"])
+    extra = set(raw) - {"container", "image"}
+    if extra:
+        raise RemediationError(f"'set-image' got unexpected params: {sorted(extra)}")
+    return {"container": str(raw["container"]).strip(), "image": image}
+
+
+def _plan_set_image(provider, ref: WorkloadRef, params: dict) -> Plan:
+    new_image = params["image"]
+    if provider.name == "podman":
+        spec = _podman_run_spec(provider, ref)
+        return Plan(
+            action="set-image", risk="medium", params=params,
+            target=f"container {ref.name}",
+            summary=f"set image on {ref.name}: {spec['image']} → {new_image} (recreates)",
+            old={"image": spec["image"]}, new={"image": new_image},
+            reversal={"action": "set-image",
+                      "params": {"container": params["container"], "image": spec["image"]}},
+        )
+    _check_namespace(ref)
+    controller = _resolve_controller(provider, ref)
+    current = _kubectl_json(
+        provider, ["get", controller["kind"].lower(), controller["name"],
+                   "-n", controller["namespace"], "-o", "json"])
+    container_name = params["container"]
+    c = _k8s_container(current, container_name)
+    old_image = c.get("image", "")
+    target = f"{controller['kind'].lower()}/{controller['name']}/{container_name}"
+    return Plan(
+        action="set-image", risk="medium", params=params,
+        target=f"{target} (ns={controller['namespace']})",
+        summary=f"set image on {target}: {old_image} → {new_image}",
+        old={"image": old_image}, new={"image": new_image},
+        reversal={"action": "set-image",
+                  "params": {"container": container_name, "image": old_image}},
+    )
+
+
+def _execute_set_image(provider, ref: WorkloadRef, plan: Plan) -> ActionResult:
+    new_image = plan.params["image"]
+    if provider.name == "podman":
+        spec = _podman_run_spec(provider, ref)
+        run, err = _podman_recreate(provider, ref, spec, spec["env"], new_image)
+        if run is None:
+            return ActionResult("set-image", False, err,
+                                plan=asdict(plan), reversal=plan.reversal)
+        return ActionResult("set-image", True,
+                            f"container {ref.name} recreated on image {new_image}",
+                            plan=asdict(plan), reversal=plan.reversal)
+    controller = _resolve_controller(provider, ref)
+    proc = provider._run([
+        "set", "image",
+        f"{controller['kind'].lower()}/{controller['name']}",
+        f"{plan.params['container']}={new_image}",
+        "-n", controller["namespace"],
+    ], check=False)
+    if proc.returncode != 0:
+        return ActionResult("set-image", False, _clean(proc.stderr) or "set image failed",
+                            plan=asdict(plan), reversal=plan.reversal)
+    return ActionResult("set-image", True,
+                        f"{controller['kind'].lower()}/{controller['name']} "
+                        f"image set to {new_image}",
+                        plan=asdict(plan), reversal=plan.reversal)
+
+
+# -- recreate (podman: rebuild; kubernetes: combined patch) -------------------
+
+def _parse_recreate(raw: dict) -> dict:
+    if "container" not in raw or not str(raw["container"]).strip():
+        raise RemediationError("'recreate' requires 'container'")
+    out: dict = {"container": str(raw["container"]).strip()}
+    if raw.get("image"):
+        out["image"] = _validate_image(raw["image"])
+    if raw.get("env") not in (None, ""):
+        out["env"] = _parse_env_map(raw["env"])
+    if raw.get("command") not in (None, ""):
+        out["command"] = _as_str_list(raw["command"], "command")
+    if raw.get("args") not in (None, ""):
+        out["args"] = _as_str_list(raw["args"], "args")
+    if len(out) == 1:
+        raise RemediationError(
+            "'recreate' needs at least one of image, env, command, args")
+    extra = set(raw) - {"container", "image", "env", "command", "args"}
+    if extra:
+        raise RemediationError(f"'recreate' got unexpected params: {sorted(extra)}")
+    return out
+
+
+def _as_str_list(value, name: str) -> list:
+    if isinstance(value, str):
+        # allow a single string -> one-element list
+        return [value]
+    if isinstance(value, list) and all(isinstance(x, (str, int, float)) for x in value):
+        return [str(x) for x in value]
+    raise RemediationError(f"{name} must be a string or a list of strings")
+
+
+def _plan_recreate(provider, ref: WorkloadRef, params: dict) -> Plan:
+    changed = [k for k in ("image", "env", "command", "args") if k in params]
+    if provider.name == "podman":
+        spec = _podman_run_spec(provider, ref)
+        return Plan(
+            action="recreate", risk="high", params=params,
+            target=f"container {ref.name}",
+            summary=f"recreate {ref.name} (changing: {', '.join(changed)})",
+            old={"image": spec["image"], "env": _env_list_to_map(spec["env"]),
+                 "cmd": spec.get("cmd")},
+            new={k: params[k] for k in changed},
+            reversal={},  # full recreate isn't auto-reversible; spec is in `old`
+        )
+    _check_namespace(ref)
+    controller = _resolve_controller(provider, ref)
+    current = _kubectl_json(
+        provider, ["get", controller["kind"].lower(), controller["name"],
+                   "-n", controller["namespace"], "-o", "json"])
+    c = _k8s_container(current, params["container"])
+    target = f"{controller['kind'].lower()}/{controller['name']}/{params['container']}"
+    return Plan(
+        action="recreate", risk="high", params=params,
+        target=f"{target} (ns={controller['namespace']})",
+        summary=f"recreate {target} (changing: {', '.join(changed)})",
+        old={"image": c.get("image"), "command": c.get("command"),
+             "args": c.get("args")},
+        new={k: params[k] for k in changed},
+        reversal={},
+    )
+
+
+def _execute_recreate(provider, ref: WorkloadRef, plan: Plan) -> ActionResult:
+    params = plan.params
+    if provider.name == "podman":
+        spec = _podman_run_spec(provider, ref)
+        new_image = params.get("image") or spec["image"]
+        new_env = _merge_env(spec["env"], params["env"]) if "env" in params else spec["env"]
+        if "command" in params or "args" in params:
+            spec = dict(spec)
+            if "command" in params:
+                spec["entrypoint"] = params["command"]
+                spec["cmd"] = params.get("args")
+            elif "args" in params:
+                spec["cmd"] = params["args"]
+        run, err = _podman_recreate(provider, ref, spec, new_env, new_image)
+        if run is None:
+            return ActionResult("recreate", False, err,
+                                plan=asdict(plan), reversal=plan.reversal)
+        return ActionResult("recreate", True,
+                            f"container {ref.name} recreated",
+                            plan=asdict(plan), reversal=plan.reversal)
+    # Kubernetes — one strategic-merge patch with all changed fields.
+    controller = _resolve_controller(provider, ref)
+    container_patch: dict = {"name": params["container"]}
+    if "image" in params:
+        container_patch["image"] = params["image"]
+    if "command" in params:
+        container_patch["command"] = params["command"]
+    if "args" in params:
+        container_patch["args"] = params["args"]
+    if "env" in params:
+        container_patch["env"] = [
+            {"name": k, "value": v} for k, v in params["env"].items() if v is not None
+        ]
+    patch = {"spec": {"template": {"spec": {"containers": [container_patch]}}}}
+    proc = provider._run([
+        "patch", controller["kind"].lower(), controller["name"],
+        "-n", controller["namespace"], "--type=strategic",
+        "-p", json.dumps(patch),
+    ], check=False)
+    if proc.returncode != 0:
+        return ActionResult("recreate", False, _clean(proc.stderr) or "patch failed",
+                            plan=asdict(plan), reversal=plan.reversal)
+    return ActionResult("recreate", True,
+                        f"{controller['kind'].lower()}/{controller['name']} recreated",
+                        plan=asdict(plan), reversal=plan.reversal)
+
+
+def _k8s_container(deployment: dict, container_name: str) -> dict:
+    containers = (deployment.get("spec", {}).get("template", {})
+                  .get("spec", {}).get("containers", []))
+    c = next((x for x in containers if x.get("name") == container_name), None)
+    if c is None:
+        raise RemediationError(
+            f"container {container_name!r} not in the workload "
+            f"(have: {[x.get('name') for x in containers]})")
+    return c
+
+
+_SECRET_KEY_RE = re.compile(r"(SECRET|TOKEN|PASSWORD|PASSWD|KEY|CREDENTIAL)", re.I)
+
+
+def _looks_secret(key: str) -> bool:
+    return bool(_SECRET_KEY_RE.search(key))
+
+
 # --- catalog -----------------------------------------------------------------
 
 CATALOG: dict[str, ActionSpec] = {
@@ -754,6 +1178,29 @@ CATALOG: dict[str, ActionSpec] = {
         platforms=("kubernetes",),
         description="kubectl rollout undo on the workload's controller",
         parse=_parse_rollback, plan=_plan_rollback, execute=_execute_rollback,
+    ),
+    "set-env": ActionSpec(
+        name="set-env", risk="medium",
+        platforms=("podman", "kubernetes"),
+        description="set/replace environment variables on the container "
+                    "(K8s patches the Deployment; Podman recreates the "
+                    "container). A null value deletes the key.",
+        parse=_parse_set_env, plan=_plan_set_env, execute=_execute_set_env,
+    ),
+    "set-image": ActionSpec(
+        name="set-image", risk="medium",
+        platforms=("podman", "kubernetes"),
+        description="change the container's image (K8s `kubectl set image`; "
+                    "Podman recreates the container on the new image).",
+        parse=_parse_set_image, plan=_plan_set_image, execute=_execute_set_image,
+    ),
+    "recreate": ActionSpec(
+        name="recreate", risk="high",
+        platforms=("podman", "kubernetes"),
+        description="recreate the container with a modified spec — any subset "
+                    "of image, env, command, args. Throws away the running "
+                    "container; ports/volumes are not carried over on Podman.",
+        parse=_parse_recreate, plan=_plan_recreate, execute=_execute_recreate,
     ),
 }
 
@@ -1019,7 +1466,12 @@ def _kubectl_json(provider, args: list[str]) -> dict:
 # Kubernetes deletes the pod (the controller recreates a *different* pod), so
 # the original ref becomes stale — we mark verification as "unknown" rather
 # than attempt a brittle controller-walk in this iteration.
-_VERIFY_SAME_REF = {"restart", "set-resources", "adjust-probe", "scale", "rollback"}
+_VERIFY_SAME_REF = {"restart", "set-resources", "adjust-probe", "scale", "rollback",
+                    "set-env", "set-image", "recreate"}
+# On Kubernetes these create a *new* pod (different name), so the original ref
+# goes stale exactly like `restart`. On Podman they recreate the container
+# under the SAME name, so re-reading the ref works.
+_VERIFY_NEW_POD_ON_K8S = {"restart", "set-env", "set-image", "recreate"}
 DEFAULT_VERIFY_WAIT = 5
 
 
@@ -1072,9 +1524,9 @@ def verify_recovery(
                 "waited_seconds": 0}
 
     # Some actions destroy/recreate the original ref — don't pretend to verify.
-    if action == "restart" and ref.platform in ("kubernetes", "openshift"):
+    if action in _VERIFY_NEW_POD_ON_K8S and ref.platform in ("kubernetes", "openshift"):
         return {"outcome": "unknown",
-                "reason": "the pod was deleted; its controller recreates a "
+                "reason": "the change replaces the pod; its controller creates a "
                           "new pod with a different name — check the workload",
                 "baseline": baseline, "observed": {},
                 "waited_seconds": 0}

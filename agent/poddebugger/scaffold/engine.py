@@ -51,6 +51,16 @@ _PROBE_OUTPUT_CAP = 6000  # chars of probe output recorded as evidence
 _EXTRA_ITERS_AFTER_FINDING = 2
 
 
+def _ref_to_dict(ref: WorkloadRef) -> dict:
+    """Serialize a WorkloadRef for the undo-save payload."""
+    return {
+        "name": ref.name,
+        "namespace": ref.namespace,
+        "container": ref.container,
+        "platform": ref.platform,
+    }
+
+
 def _clamp(value) -> float:
     try:
         return max(0.0, min(1.0, float(value)))
@@ -109,6 +119,8 @@ class InvestigationEngine:
         research_enabled: bool = False,
         search_backend: SearchBackend | None = None,
         gate=None,
+        context: dict | None = None,
+        max_remediation_attempts: int = 3,
     ):
         self.provider = provider
         # Accept either a single client (all roles) or a per-role resolver.
@@ -120,6 +132,11 @@ class InvestigationEngine:
         self.verbose = verbose
         self.remediation_enabled = remediation_enabled
         self.research_enabled = research_enabled
+        # Phase 13C — values the user supplied that the system can't infer
+        # (db password, correct image name, …). Threaded into the Remediator.
+        self.context: dict = dict(context or {})
+        # Phase 13A — cap on how many fixes the loop will try before giving up.
+        self.max_remediation_attempts = max_remediation_attempts
         # The Librarian formulates queries; this backend runs them. Default
         # noop keeps the engine air-gap safe (HLD §13.3).
         self.search_backend: SearchBackend = (
@@ -464,7 +481,8 @@ class InvestigationEngine:
 
     # --- remediation proposal (Phase 7B) ------------------------------------
 
-    def propose_remediation(self, diagnosis: Diagnosis) -> dict | None:
+    def propose_remediation(self, diagnosis: Diagnosis,
+                            attempts: list | None = None) -> dict | None:
         """Ask the Remediator to fill a typed catalog form for this diagnosis.
 
         Returns a dict the CLI / operator stores on
@@ -472,14 +490,19 @@ class InvestigationEngine:
 
         * Successful proposal with a validated plan::
 
-              {"action": "<name>", "params": {...}, "risk": "low|medium",
+              {"action": "<name>", "params": {...}, "risk": "low|medium|high",
                "rationale": "...", "expected_effect": "...", "confidence": 0.0,
                "plan": <Plan-as-dict>, "reversal": {...},
                "validated": True}
 
         * ``"action": "none"`` — no catalog action fits (also returned if the
           model proposes one but it fails catalog validation; ``validation_error``
-          is set in that case so the CLI can show it to a human).
+          is set in that case so the CLI can show it to a human). May carry
+          ``needs_context`` (a list of missing-value requests — Phase 13C).
+
+        ``attempts`` is the list of prior fixes that did not recover the
+        workload (Phase 13A), shown to the agent so it tries something
+        different.
 
         Returns ``None`` if the Remediator was not registered (``--fix`` not
         in effect) or its call failed entirely.
@@ -496,6 +519,8 @@ class InvestigationEngine:
                 "confidence": diagnosis.confidence,
             },
             "platform": self._ref.platform,
+            "context": self.context,
+            "attempts": attempts or [],
         }
         result = self._run("Remediator", ctx, extras=extras)
         if not result:
@@ -541,6 +566,216 @@ class InvestigationEngine:
             "reversal": plan.reversal or None,
             "validated": True,
         }
+
+    # --- adaptive remediation loop (Phase 13A) ------------------------------
+
+    def apply_remediation(self, proposal: dict, *, max_risk: str = "low",
+                          verify_wait: int = remediation.DEFAULT_VERIFY_WAIT) -> dict:
+        """Execute one validated proposal under the gate + risk tier, then
+        verify recovery. Mirrors what the CLI used to do inline, but lives in
+        the engine so the loop can reuse it.
+
+        Returns a dict with ``executed`` / ``skipped`` / ``verification`` /
+        ``reversal`` / ``saved_to`` keys.
+        """
+        risk = proposal.get("risk", "medium")
+        ranking = {"low": 0, "medium": 1, "high": 2}
+        if ranking.get(risk, 99) > ranking.get(max_risk, 0):
+            return {"executed": False, "skipped": True,
+                    "action": proposal["action"],
+                    "reason": f"risk={risk} exceeds max-risk={max_risk}"}
+        try:
+            params = remediation.parse_params(
+                proposal["action"], proposal.get("params") or {})
+            plan = remediation.make_plan(self.provider, self._ref,
+                                         proposal["action"], params)
+        except (remediation.RemediationError, ProviderError) as exc:
+            return {"executed": False, "skipped": True,
+                    "action": proposal["action"], "reason": str(exc)}
+
+        baseline = (remediation.capture_baseline(self.provider, self._ref)
+                    if verify_wait > 0 else {})
+        result = remediation.execute(self.provider, self._ref, plan, gate=self.gate)
+        verification = None
+        if result.executed and verify_wait > 0:
+            verification = remediation.verify_recovery(
+                self.provider, self._ref, baseline, plan.action, verify_wait)
+        saved_path = None
+        if result.executed:
+            saved_path = str(remediation.save_for_undo(self._ref, {
+                "action": result.action, "executed": True,
+                "result": result.result, "plan": result.plan,
+                "reversal": result.reversal,
+                "target": _ref_to_dict(self._ref),
+                "verification": verification,
+            }))
+            self.state.record_dispatch(
+                "Remediator", f"applied {result.action}",
+                (verification or {}).get("outcome", "applied"))
+            self._commit(f"remediation applied: {result.action}")
+        return {
+            "executed": result.executed,
+            "skipped": False,
+            "action": result.action,
+            "result": result.result,
+            "plan": result.plan,
+            "reversal": result.reversal,
+            "verification": verification,
+            "saved_to": saved_path,
+        }
+
+    def remediate(self, diagnosis: Diagnosis, *, apply: bool = False,
+                  max_risk: str = "low",
+                  verify_wait: int = remediation.DEFAULT_VERIFY_WAIT) -> dict:
+        """Drive the full propose → apply → verify → replan loop (Phase 13A).
+
+        With ``apply=False`` this proposes a single fix and stops (the
+        ``analyze --fix`` preview behavior). With ``apply=True`` it keeps
+        trying — up to ``max_remediation_attempts`` — until the workload
+        recovers, the agent gives up (``action=none``), the gate refuses, or
+        a needed context value is missing.
+
+        Returns::
+
+            {"outcome": "resolved" | "unresolved" | "proposed" | "refused"
+                        | "needs_context" | "no_action",
+             "attempts": [ {proposal, applied, verification}, ... ],
+             "final_proposal": <last proposal dict>,
+             "needs_context": [...]   # when outcome == needs_context
+            }
+        """
+        attempts: list[dict] = []
+        last_proposal: dict | None = None
+
+        for attempt_no in range(1, self.max_remediation_attempts + 1):
+            # Show the Remediator what already failed so it varies its choice.
+            failed = [{
+                "action": a["proposal"].get("action"),
+                "params": a["proposal"].get("params"),
+                "outcome": ((a.get("applied") or {}).get("verification") or {}).get(
+                    "outcome", "applied"),
+                "reason": ((a.get("applied") or {}).get("verification") or {}).get(
+                    "reason", "") or (a.get("applied") or {}).get("reason", ""),
+            } for a in attempts]
+
+            proposal = self.propose_remediation(diagnosis, attempts=failed)
+            last_proposal = proposal
+            if proposal is None:
+                return {"outcome": "no_action", "attempts": attempts,
+                        "final_proposal": None}
+
+            action = proposal.get("action", "none")
+            if action == "none":
+                nc = proposal.get("needs_context")
+                if nc:
+                    return {"outcome": "needs_context", "attempts": attempts,
+                            "final_proposal": proposal, "needs_context": nc}
+                # The agent honestly has no (further) idea.
+                outcome = "unresolved" if attempts else "no_action"
+                return {"outcome": outcome, "attempts": attempts,
+                        "final_proposal": proposal}
+
+            if not proposal.get("validated"):
+                # validation failed in propose_remediation
+                return {"outcome": "no_action", "attempts": attempts,
+                        "final_proposal": proposal}
+
+            if not apply:
+                return {"outcome": "proposed", "attempts": attempts,
+                        "final_proposal": proposal}
+
+            applied = self.apply_remediation(
+                proposal, max_risk=max_risk, verify_wait=verify_wait)
+            attempts.append({"proposal": proposal, "applied": applied})
+
+            if applied.get("skipped"):
+                # Risk tier or validation stopped us before execution — the
+                # loop can't proceed.
+                return {"outcome": "blocked", "attempts": attempts,
+                        "final_proposal": proposal}
+
+            if not applied.get("executed"):
+                # The gate refused, or the action couldn't run. A gate refusal
+                # is the user's explicit "no" — stop, don't keep trying. An
+                # execution error is a dead fix — let the team try another.
+                if "approval gate" in str(applied.get("result", "")):
+                    return {"outcome": "refused", "attempts": attempts,
+                            "final_proposal": proposal}
+                self.state.add_evidence(
+                    f"remediation '{proposal.get('action')}' failed to execute",
+                    detail=str(applied.get("result", "")),
+                    source=f"remediator:{proposal.get('action')}:failed",
+                )
+                if attempt_no < self.max_remediation_attempts:
+                    self._replan_after_failed_fix()
+                    diagnosis = self._refresh_diagnosis() or diagnosis
+                continue
+
+            verification = applied.get("verification") or {}
+            outcome = verification.get("outcome")
+            if outcome == "recovered":
+                return {"outcome": "resolved", "attempts": attempts,
+                        "final_proposal": proposal}
+
+            # still-failing / unknown / skipped → record as evidence and
+            # let the whole team reconsider before the next attempt.
+            self._record_failed_fix(proposal, verification)
+            if attempt_no < self.max_remediation_attempts:
+                self._replan_after_failed_fix()
+                # Re-report so the next proposal reflects the new picture.
+                diagnosis = self._refresh_diagnosis() or diagnosis
+
+        return {"outcome": "unresolved", "attempts": attempts,
+                "final_proposal": last_proposal}
+
+    def _record_failed_fix(self, proposal: dict, verification: dict) -> None:
+        outcome = verification.get("outcome", "unknown")
+        reason = verification.get("reason", "")
+        self.state.add_evidence(
+            f"remediation '{proposal.get('action')}' did not recover the "
+            f"workload ({outcome})",
+            detail=reason,
+            source=f"remediator:{proposal.get('action')}:{outcome}",
+        )
+        self._log(f"remediation '{proposal.get('action')}' → {outcome}; replanning")
+
+    def _replan_after_failed_fix(self) -> None:
+        """Run a short continuation of the Coordinator loop so the team can
+        revise hypotheses given the new evidence, then re-audit."""
+        if self.state is None or self._ref is None:
+            return
+        ctx = collect(self.provider, self._ref, log_lines=self.log_lines)
+        self.state.phase = "investigating"
+        extra_rounds = 2
+        for _ in range(extra_rounds):
+            if not self._budget_ok():
+                break
+            self.state.iteration += 1
+            coord = self._run("Coordinator", ctx, extras={
+                "iterations_left": extra_rounds,
+                "actions": self._action_menu(),
+            })
+            action, target, instruction = coord if coord else ("done", "", "")
+            if action == "done":
+                break
+            if action == "probe" and not self.state.hypotheses \
+                    and not self.state.confirmed_findings:
+                action = "analyze"
+            self._dispatch_action(action, ctx, target, instruction)
+            self._commit(f"replan iteration {self.state.iteration}: {action}")
+        if self._budget_ok():
+            self._run_audit_chain(ctx)
+
+    def _refresh_diagnosis(self) -> Diagnosis | None:
+        """Re-run the Reporter to get a fresh diagnosis after replanning."""
+        if self.state is None or self._ref is None:
+            return None
+        ctx = collect(self.provider, self._ref, log_lines=self.log_lines)
+        self.state.phase = "reporting"
+        data = self._run("Reporter", ctx)
+        if data is None:
+            return None
+        return _to_diagnosis(data)
 
     # --- public entry point -------------------------------------------------
 
