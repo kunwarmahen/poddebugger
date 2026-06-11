@@ -127,6 +127,7 @@ class InvestigationEngine:
         experience_store=None,
         specialists_enabled: bool = False,
         max_specialists: int = 2,
+        prompt_pack: dict | None = None,
     ):
         self.provider = provider
         # Accept either a single client (all roles) or a per-role resolver.
@@ -191,6 +192,14 @@ class InvestigationEngine:
             self._register(agent)
         for agent in load_agents_from_env():
             self._register(agent)
+        # Phase 15C — prompt pack: per-role system-prompt replacements
+        # (already validated by promptpack.load_pack). Instance-attribute
+        # override, so other engines / fresh agents keep the built-ins.
+        # Roles not registered in THIS engine (e.g. Remediator without
+        # --fix) are simply not consulted.
+        for role, text in (prompt_pack or {}).items():
+            if role in self._agents:
+                self._agents[role].system_prompt = text
 
         # populated during a run
         self.state: InvestigationState | None = None

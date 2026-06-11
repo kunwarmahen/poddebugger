@@ -66,6 +66,13 @@ example](examples/log_investigator/) is included).
   fixes that did NOT work — so the team starts from experience instead
   of a blank slate. Learning only changes what the LLM is *told*, never
   what it is *allowed* to do.
+- **Prompts as data + self-optimization (offline).** Agent system
+  prompts can live in a versioned *prompt pack* (`poddebugger prompts
+  dump`, `analyze --prompt-pack`). A deterministic scenario suite
+  (`poddebugger eval`) scores investigation quality against known
+  failures, and `poddebugger optimize` lets an LLM critic evolve the
+  pack — an edit is kept only if the score strictly improves, and you
+  review the diff before trusting it.
 
 ---
 
@@ -306,6 +313,36 @@ free). Every composed prompt is persisted to `specialists/<slug>.md` inside
 the run workspace and captured by the per-iteration git commit, so runs
 stay replayable and auditable.
 
+### Evaluate, then evolve the prompts (offline)
+
+```bash
+# Score the agent team against known failure scenarios (needs Podman + an LLM)
+poddebugger eval --llm-provider ollama --model qwen3.5:9b
+
+# Materialize the built-in prompts as a versioned pack…
+poddebugger prompts dump ./prompt-pack && git -C ./prompt-pack init -q && \
+    git -C ./prompt-pack add -A && git -C ./prompt-pack commit -qm baseline
+
+# …let an LLM critic evolve it against the eval suite…
+poddebugger optimize --pack ./prompt-pack --rounds 3 \
+    --llm-provider ollama --model qwen3.5:9b
+
+# …review what changed, then use the pack
+git -C ./prompt-pack diff
+poddebugger analyze my-broken-container --prompt-pack ./prompt-pack
+```
+
+The eval suite (`missing-env`, `crash-loop`, `oom`, `bad-command`, `dns`)
+stands real failing containers up and scores the diagnosis
+deterministically: 1 point for the right failure classification, 1 point
+for proposing an acceptable catalog action — **propose-only, nothing is
+ever applied**. The optimizer adopts a critic's edit only when the suite
+score strictly improves, writes it as a plain file change in the pack,
+and never touches prompts during a normal `analyze` run. Pack loading is
+validated (size caps, JSON answer-format marker preserved) so a pack can
+degrade quality but not break the agents' wire format — and the catalog
+validator and approval gate stay the only capability boundary either way.
+
 ### Learn from past incidents (opt-in)
 
 ```bash
@@ -415,6 +452,7 @@ to get started.
 | `PODDEBUGGER_ALLOW_SHELL` | `1` enables the freeform `shell` catalog action | unset |
 | `PODDEBUGGER_LEARN` | `1` enables cross-run experience memory (same as `--learn`) | unset |
 | `PODDEBUGGER_SPECIALISTS` | `1` lets the Coordinator spawn specialist agents (same as `--specialists`) | unset |
+| `PODDEBUGGER_PROMPT_PACK` | prompt-pack directory (same as `--prompt-pack`) | unset (built-ins) |
 | `PODDEBUGGER_EXPERIENCE_DIR` | where experience records are stored | `~/.local/share/poddebugger/experience/` |
 | `PODDEBUGGER_REMEDIATION_MODE` | operator default mode | `SuggestOnly` |
 | `PODDEBUGGER_LOG_LINES` | log tail size collected | `200` |

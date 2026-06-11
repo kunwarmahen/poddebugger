@@ -166,7 +166,11 @@ ollama reports eval counts.
 
 ## 4. New capabilities (rank by demonstrated need)
 
-### 4.1 Scenario/eval harness (recommended first — protects everything else)
+### 4.1 Scenario/eval harness — ✅ built (as part of Phase 15C)
+
+> Status: shipped as `poddebugger/scenarios.py` + the `poddebugger eval`
+> subcommand (TODO Stage 15C). Five built-in scenarios; deterministic
+> classification + propose-only action scoring; out of CI as planned.
 The agent's *quality* is only verified by occasional live runs; the unit
 tests verify plumbing with scripted LLMs. Build a `scenarios/` suite:
 each scenario = a Podman container spec that fails a known way (OOM, bad
@@ -214,11 +218,12 @@ collected) and cAdvisor if present. The Analyst prompt gains a metrics
 block when enabled. The `examples/custom_agent.py` MetricsAgent stub shows
 where the agent-side hook goes.
 
-### 4.6 Self-learning loop (dynamic prompts + cross-run memory) — Layer 2 ✅ built
+### 4.6 Self-learning loop (dynamic prompts + cross-run memory) — ✅ all three layers built
 
-> Status: promoted to **Phase 15** (HLD §19, TODO.md). Layer 2 (experience
-> store + Historian recall) shipped as Stage 15A. Layers 1 and 3 are staged
-> as 15B / 15C.
+> Status: promoted to **Phase 15** (HLD §19, TODO.md) and fully shipped:
+> Layer 2 (experience store + Historian recall) as Stage 15A, Layer 1
+> (dynamic specialist agents) as Stage 15B, Layer 3 (prompt packs + eval
+> harness + optimizer) as Stage 15C.
 
 Three layers, independent and increasing in ambition. The safety framing
 for all of them: learning changes what the LLM is *told*, never what it is

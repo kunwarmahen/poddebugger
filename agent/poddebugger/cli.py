@@ -138,6 +138,18 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         print(_render_context(ctx))
         return 0
 
+    # Phase 15C — optional prompt pack (validated on load).
+    prompt_pack = None
+    pack_dir = args.prompt_pack or cfg.prompt_pack
+    if pack_dir:
+        from . import promptpack
+
+        try:
+            prompt_pack = promptpack.load_pack(pack_dir)
+        except (promptpack.PromptPackError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
     # Full multi-agent investigation (the Phase 6 scaffold — HLD §11).
     # Each agent uses the default LLM unless a PODDEBUGGER_<ROLE>_LLM_* override
     # is set; AgentLLMs resolves that per role.
@@ -168,6 +180,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             max_remediation_attempts=args.max_attempts,
             learning_enabled=bool(args.learn or cfg.learn),
             specialists_enabled=bool(args.specialists or cfg.specialists),
+            prompt_pack=prompt_pack,
         )
         diagnosis = engine.investigate(ref)
     except (LLMError, ProviderError) as exc:
@@ -561,6 +574,12 @@ def build_parser() -> argparse.ArgumentParser:
              "Inspect the store with `poddebugger experience list`.",
     )
     a.add_argument(
+        "--prompt-pack", default=None, metavar="DIR",
+        help="load per-agent system prompts from a prompt-pack directory "
+             "(<Role>.txt files; see `poddebugger prompts dump`). "
+             "Default: PODDEBUGGER_PROMPT_PACK or the built-in prompts.",
+    )
+    a.add_argument(
         "--specialists",
         action="store_true",
         help="let the Coordinator spawn domain-specialist agents mid-run "
@@ -651,6 +670,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     _build_approvals_parser(sub)
     _build_experience_parser(sub)
+    _build_prompts_parser(sub)
+    _build_eval_parser(sub)
+    _build_optimize_parser(sub)
 
     return parser
 
@@ -832,6 +854,172 @@ def _build_experience_parser(sub) -> None:
 
     ex_clear = ex_sub.add_parser("clear", help="delete every remembered incident")
     ex_clear.set_defaults(func=_cmd_experience_clear)
+
+
+def _cmd_prompts_dump(args: argparse.Namespace) -> int:
+    from . import promptpack
+
+    try:
+        written = promptpack.dump_pack(args.directory, force=args.force)
+    except (promptpack.PromptPackError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"wrote {len(written)} prompt files to {args.directory}")
+    print("(edit them, or run `poddebugger optimize --pack` to evolve them; "
+          "keep the directory under version control)")
+    return 0
+
+
+def _cmd_prompts_list(args: argparse.Namespace) -> int:
+    from . import promptpack
+
+    try:
+        rows = promptpack.describe_pack(args.directory)
+    except (promptpack.PromptPackError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"# {args.directory}")
+    for role, chars, differs in rows:
+        mark = "modified" if differs else "= built-in"
+        print(f"  {role:14} {chars:6} chars  {mark}")
+    return 0
+
+
+def _build_prompts_parser(sub) -> None:
+    """`poddebugger prompts dump/list` — Phase 15C prompt packs."""
+    pp = sub.add_parser(
+        "prompts",
+        help="manage prompt packs (per-agent system prompts as files)",
+    )
+    pp_sub = pp.add_subparsers(dest="prompts_cmd", required=True)
+
+    pp_dump = pp_sub.add_parser(
+        "dump", help="write the built-in prompts to DIR as a starting pack")
+    pp_dump.add_argument("directory")
+    pp_dump.add_argument("--force", action="store_true",
+                         help="overwrite an existing pack")
+    pp_dump.set_defaults(func=_cmd_prompts_dump)
+
+    pp_list = pp_sub.add_parser(
+        "list", help="show what a pack overrides vs the built-ins")
+    pp_list.add_argument("directory")
+    pp_list.set_defaults(func=_cmd_prompts_list)
+
+
+def _eval_components(args):
+    """Shared setup for `eval` and `optimize`: config, LLMs, scenarios, pack."""
+    from . import promptpack, scenarios
+
+    cfg = Config.from_env()
+    if args.llm_provider:
+        cfg.llm_provider = args.llm_provider
+    if args.model:
+        cfg.llm_model = args.model
+    llms = AgentLLMs.from_config(cfg)
+
+    names = args.scenario or sorted(scenarios.BUILTIN_SCENARIOS)
+    unknown = [n for n in names if n not in scenarios.BUILTIN_SCENARIOS]
+    if unknown:
+        raise SystemExit(
+            f"error: unknown scenario(s) {unknown} — "
+            f"available: {sorted(scenarios.BUILTIN_SCENARIOS)}")
+    selected = [scenarios.BUILTIN_SCENARIOS[n] for n in names]
+    return cfg, llms, selected, promptpack, scenarios
+
+
+def _cmd_eval(args: argparse.Namespace) -> int:
+    cfg, llms, selected, promptpack, scenarios = _eval_components(args)
+    pack = None
+    if args.prompt_pack:
+        try:
+            pack = promptpack.load_pack(args.prompt_pack)
+        except (promptpack.PromptPackError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    investigate = scenarios.make_investigate(
+        llms, prompt_pack=pack, log_lines=cfg.log_lines, verbose=args.verbose)
+    log = (lambda m: print(m, file=sys.stderr)) if args.verbose else None
+    score = scenarios.run_suite(selected, investigate, log=log)
+    if args.json:
+        print(json.dumps({
+            "total": score.total, "max": score.max_total,
+            "results": [dataclasses.asdict(r) for r in score.results],
+        }, indent=2))
+    else:
+        print(scenarios.render_table(score))
+        print(f"(evaluated with {llms.describe()})")
+    return 0
+
+
+def _build_eval_parser(sub) -> None:
+    """`poddebugger eval` — Phase 15C scenario harness. Needs Podman + LLM."""
+    ev = sub.add_parser(
+        "eval",
+        help="run the scenario eval suite (needs Podman + an LLM) — the "
+             "quality regression test for prompt/model changes",
+    )
+    ev.add_argument("--scenario", action="append", metavar="NAME",
+                    help="run only this scenario (repeatable; default: all)")
+    ev.add_argument("--prompt-pack", default=None, metavar="DIR",
+                    help="evaluate with this prompt pack instead of built-ins")
+    ev.add_argument("--llm-provider", default=None,
+                    choices=["anthropic", "openai", "ollama", "llamacpp"])
+    ev.add_argument("--model", default=None, help="LLM model id override")
+    ev.add_argument("--json", action="store_true")
+    ev.add_argument("--verbose", action="store_true")
+    ev.set_defaults(func=_cmd_eval)
+
+
+def _cmd_optimize(args: argparse.Namespace) -> int:
+    from . import promptopt
+
+    cfg, llms, selected, promptpack, scenarios = _eval_components(args)
+    try:
+        promptpack.load_pack(args.pack)  # fail fast on a bad pack
+    except (promptpack.PromptPackError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        print("(create one with `poddebugger prompts dump DIR`)", file=sys.stderr)
+        return 1
+
+    def score_fn(pack: dict):
+        investigate = scenarios.make_investigate(
+            llms, prompt_pack=pack, log_lines=cfg.log_lines,
+            verbose=args.verbose)
+        return scenarios.run_suite(selected, investigate)
+
+    critic = llms.for_role("PromptCritic")
+    report = promptopt.optimize(
+        args.pack, score_fn=score_fn, critic=critic,
+        roles=tuple(args.role or promptopt.DEFAULT_TARGET_ROLES),
+        rounds=args.rounds, log=print)
+    print(f"\nbaseline {report.baseline_total}/{report.max_total} -> "
+          f"final {report.final_total}/{report.max_total} "
+          f"({sum(1 for r in report.rounds if r.adopted)} edit(s) adopted)")
+    print(f"review the pack diff before trusting it: git -C {args.pack} diff "
+          "(or your VCS of choice)")
+    return 0
+
+
+def _build_optimize_parser(sub) -> None:
+    """`poddebugger optimize` — Phase 15C offline prompt optimization."""
+    op = sub.add_parser(
+        "optimize",
+        help="evolve a prompt pack against the eval suite (offline, "
+             "human-reviewed; needs Podman + an LLM)",
+    )
+    op.add_argument("--pack", required=True, metavar="DIR",
+                    help="prompt-pack directory to optimize (edits land here)")
+    op.add_argument("--rounds", type=int, default=1)
+    op.add_argument("--role", action="append", metavar="ROLE",
+                    help="roles the critic may edit (repeatable; default: "
+                         "the judgment-heavy six)")
+    op.add_argument("--scenario", action="append", metavar="NAME",
+                    help="score on these scenarios only (repeatable)")
+    op.add_argument("--llm-provider", default=None,
+                    choices=["anthropic", "openai", "ollama", "llamacpp"])
+    op.add_argument("--model", default=None, help="LLM model id override")
+    op.add_argument("--verbose", action="store_true")
+    op.set_defaults(func=_cmd_optimize)
 
 
 def _add_approval_flags(parser: argparse.ArgumentParser) -> None:

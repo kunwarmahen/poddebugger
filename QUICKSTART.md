@@ -437,6 +437,33 @@ it (strips IPs, UUIDs, hex IDs, pod-suffix patterns) before any HTTP
 request, then runs it through the backend. Hits land in the investigation
 as Evidence tagged `web:<domain>` — leads, not authority.
 
+### Score the team, then evolve its prompts (offline)
+
+The eval suite stands up real failing containers and scores the diagnosis
+deterministically — your regression test for prompt or model changes:
+
+```bash
+poddebugger eval --llm-provider ollama --model qwen3.5:9b
+# scenario        pts     classification               action        notes
+# missing-env    2/2      ConfigError ✓                set-env ✓
+# ...
+# TOTAL          7/7
+```
+
+Prompts can become data — and then evolve:
+
+```bash
+poddebugger prompts dump ./prompt-pack          # built-ins as <Role>.txt files
+poddebugger optimize --pack ./prompt-pack --rounds 3 \
+    --llm-provider ollama --model qwen3.5:9b    # keep edits only if score improves
+git -C ./prompt-pack diff                       # review before trusting
+poddebugger analyze pd-oom --prompt-pack ./prompt-pack
+```
+
+Optimization is strictly offline (never during `analyze`) and human-gated
+— winning edits are plain file diffs you review. Nothing here changes
+what the agents are *allowed* to do.
+
 ### Spawn a domain specialist mid-run
 
 With `--specialists`, the Coordinator can decide the team needs an expert

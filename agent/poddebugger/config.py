@@ -55,6 +55,8 @@ class Config:
     # Coordinator only gets the `specialist` menu action with
     # ``analyze --specialists`` or PODDEBUGGER_SPECIALISTS=1.
     specialists: bool = False
+    # Phase 15C — prompt pack directory; empty = built-in prompts.
+    prompt_pack: str = ""
     env_file: str = ""           # path of the .env that was loaded, if any
 
     @property
@@ -77,6 +79,7 @@ class Config:
             approvals_mode=os.environ.get("PODDEBUGGER_APPROVALS_MODE", "session"),
             learn=os.environ.get("PODDEBUGGER_LEARN", "") == "1",
             specialists=os.environ.get("PODDEBUGGER_SPECIALISTS", "") == "1",
+            prompt_pack=os.environ.get("PODDEBUGGER_PROMPT_PACK", ""),
         )
 
 
