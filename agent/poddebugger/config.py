@@ -57,6 +57,9 @@ class Config:
     specialists: bool = False
     # Phase 15C — prompt pack directory; empty = built-in prompts.
     prompt_pack: str = ""
+    # Stage 13D — the Coder agent. Off by default; every script still has
+    # to clear the approval gate before the sandbox runs it.
+    coder: bool = False
     env_file: str = ""           # path of the .env that was loaded, if any
 
     @property
@@ -80,6 +83,7 @@ class Config:
             learn=os.environ.get("PODDEBUGGER_LEARN", "") == "1",
             specialists=os.environ.get("PODDEBUGGER_SPECIALISTS", "") == "1",
             prompt_pack=os.environ.get("PODDEBUGGER_PROMPT_PACK", ""),
+            coder=os.environ.get("PODDEBUGGER_ENABLE_CODER", "") == "1",
         )
 
 

@@ -240,6 +240,16 @@ def _render_descriptor(descriptor: ActionDescriptor) -> str:
         reversal = descriptor.plan.get("reversal")
         if reversal:
             lines.append(f"  reversal:  {reversal}")
+        # Stage 13D — code actions carry the full script so the human sees
+        # exactly what will run before saying yes.
+        script = descriptor.plan.get("script")
+        if script:
+            body = str(script).splitlines()
+            shown = body[:30]
+            lines.append(f"  script ({descriptor.plan.get('language', '?')}):")
+            lines.extend(f"    | {l}" for l in shown)
+            if len(body) > len(shown):
+                lines.append(f"    | ... ({len(body) - len(shown)} more lines)")
     lines.append(bar)
     return "\n".join(lines)
 

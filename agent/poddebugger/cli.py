@@ -181,6 +181,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             learning_enabled=bool(args.learn or cfg.learn),
             specialists_enabled=bool(args.specialists or cfg.specialists),
             prompt_pack=prompt_pack,
+            coder_enabled=bool(args.coder or cfg.coder),
         )
         diagnosis = engine.investigate(ref)
     except (LLMError, ProviderError) as exc:
@@ -566,6 +567,16 @@ def build_parser() -> argparse.ArgumentParser:
              "invoke it directly. Equivalent to setting PODDEBUGGER_ALLOW_SHELL=1.",
     )
     a.add_argument(
+        "--coder",
+        action="store_true",
+        help="enable the Coder agent — it may write a short bash/python "
+             "script that runs in a SANDBOX container sharing the target's "
+             "network only (never its filesystem). High risk: every script "
+             "is shown in full at the approval gate. Build the sandbox "
+             "image first: podman build -t poddebugger-coder-sandbox "
+             "sandbox/. Equivalent to PODDEBUGGER_ENABLE_CODER=1.",
+    )
+    a.add_argument(
         "--learn",
         action="store_true",
         help="enable cross-run experience memory (Phase 15A) — recall similar "
@@ -784,9 +795,12 @@ def _build_approvals_parser(sub) -> None:
     ap_list.set_defaults(func=_cmd_approvals_list)
 
     ap_add = ap_sub.add_parser("add", help="add a rule")
-    ap_add.add_argument("--kind", required=True, choices=["remediation", "probe"])
+    ap_add.add_argument("--kind", required=True,
+                        choices=["remediation", "probe", "code"])
     ap_add.add_argument("--action", required=True,
-                        help="catalog action name or probe name")
+                        help="catalog action name, probe name, or (for code) "
+                             "'<language>:<script-hash-12>' as shown in the "
+                             "gate prompt / dispatch log")
     ap_add.add_argument("--target-platform", default=None,
                         help="platform: podman | kubernetes | openshift")
     ap_add.add_argument("--target-name", default=None)
@@ -803,7 +817,8 @@ def _build_approvals_parser(sub) -> None:
     ap_chk = ap_sub.add_parser(
         "check", help="what would the rules decide for this descriptor?",
     )
-    ap_chk.add_argument("--kind", required=True, choices=["remediation", "probe"])
+    ap_chk.add_argument("--kind", required=True,
+                        choices=["remediation", "probe", "code"])
     ap_chk.add_argument("--action", required=True)
     ap_chk.add_argument("--target-platform", required=True)
     ap_chk.add_argument("--target-name", default="")

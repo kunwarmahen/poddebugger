@@ -306,6 +306,17 @@ built — they're listed here so you know what's on the menu.
   option (`pip install 'poddebugger[search]'`); the `SearchBackend` ABC
   is pluggable. (Design: [HLD.md §13](HLD.md).)
 
+- **The Coder** ("the one who improvises a measurement"). The built-in
+  probes are a fixed, curated menu. With `analyze --coder`, the team
+  gains a member who can *write a new probe on the spot* — a short
+  script that runs in a sealed sidecar container sitting next to the
+  workload: it sees the same network the workload sees (its ports, its
+  DNS), but can never touch the workload's files. Before any script
+  runs, you see the entire script and say yes or no — and a saved
+  approval covers exactly that one script (by fingerprint), never "all
+  scripts". (Design: [HLD.md §18.6](HLD.md). Runnable demo:
+  [examples/coder_demo.py](examples/coder_demo.py).)
+
 - **Specialists** ("experts hired for one case"). With `analyze
   --specialists`, the Coordinator can notice mid-investigation that the
   team lacks a skill — say, deep PostgreSQL knowledge — and *create* that

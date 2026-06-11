@@ -18,6 +18,7 @@ from .base import (
     AgentContext,
     HookAgent,
 )
+from .coder import Coder
 from .coordinator import Coordinator
 from .librarian import Librarian
 from .planner import Planner
@@ -64,6 +65,7 @@ __all__ = [
     "Reporter",
     "Remediator",
     "Librarian",
+    "Coder",
     "Specialist",
     "make_specialist",
     "specialty_slug",

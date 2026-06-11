@@ -437,6 +437,27 @@ it (strips IPs, UUIDs, hex IDs, pod-suffix patterns) before any HTTP
 request, then runs it through the backend. Hits land in the investigation
 as Evidence tagged `web:<domain>` — leads, not authority.
 
+### Let the agent write a custom probe (opt-in)
+
+When the built-in probes can't answer a question, the Coder agent can
+write one — run in a sandbox sidecar that shares the target's network
+namespace but never its filesystem:
+
+```bash
+podman build -t poddebugger-coder-sandbox sandbox/    # once
+poddebugger analyze pd-dep --platform podman --coder
+# ────────────────────────────────────────────────
+# PodDebugger wants to code → bash:1cf5355a1e0c  (risk: high)
+#   script (bash):
+#     | nc -z -w 2 127.0.0.1 6379 && echo OPEN || echo closed
+# [Y]es once / [A]lways (this session) / [N]o >
+```
+
+You see the full script before it runs; non-TTY runs deny by default.
+Pre-approve one exact script with
+`poddebugger approvals add --kind code --action bash:<hash12>` — the
+hash means a rule can never say "allow all code".
+
 ### Score the team, then evolve its prompts (offline)
 
 The eval suite stands up real failing containers and scores the diagnosis

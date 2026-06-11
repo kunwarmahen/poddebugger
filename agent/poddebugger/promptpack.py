@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .scaffold.agents import Librarian, Remediator, built_in_agents
+from .scaffold.agents import Coder, Librarian, Remediator, built_in_agents
 
 #: Every agent's prompt instructs the model to answer in JSON; a replacement
 #: prompt that drops this breaks the engine's wire format, so load refuses it.
@@ -32,7 +32,7 @@ class PromptPackError(ValueError):
 
 def default_agents():
     """Fresh instances of every promptable built-in role (opt-ins included)."""
-    return built_in_agents() + [Remediator(), Librarian()]
+    return built_in_agents() + [Remediator(), Librarian(), Coder()]
 
 
 def known_roles() -> list[str]:

@@ -54,6 +54,13 @@ example](examples/log_investigator/) is included).
   via a `SearchBackend` (DuckDuckGo ships; ABC is pluggable). Queries
   are redacted (IPs, UUIDs, pod-suffix patterns) before they leave the
   host. Off by default — air-gap safe.
+- **Writes its own probes (opt-in).** With `--coder`, a Coder agent can
+  write a short bash/python script when the whitelisted probes can't
+  answer a question. It runs in a **sandbox sibling container** that
+  shares the target's network namespace only — never its filesystem —
+  and every script is shown in full at the approval gate (risk `high`,
+  deny-by-default without a TTY). Persistent rules pre-approve exactly
+  one script by hash, never "all code".
 - **Spawns specialists on the fly (opt-in).** With `--specialists`, the
   Coordinator can mid-run conjure a domain expert — "PostgreSQL crash
   analysis", "JVM heap tuning" — writing its charter itself; the charter
@@ -296,6 +303,27 @@ issuing it. Results land as evidence tagged `web:<domain>` — leads, not
 authority. The default backend is `noop` (air-gap safe). Plug your own
 with `PODDEBUGGER_SEARCH_BACKEND=mypkg.mymod.MyBackend`.
 
+### Let the agent write its own probes (opt-in)
+
+```bash
+podman build -t poddebugger-coder-sandbox sandbox/   # once
+poddebugger analyze my-broken-container --coder
+```
+
+When the curated probe menu can't answer a question ("is the database
+port actually reachable from inside the target's network?"), the Coder
+agent writes a short script and the engine runs it in a sandbox
+**sibling** container: on Podman it joins the target's network namespace
+(`--network container:<target>`); on Kubernetes it attaches as an
+ephemeral debug container (`kubectl debug`). The sandbox never shares the
+target's filesystem. Safety is the gate, not the image: every script is
+rendered in full at the approval prompt (`kind=code`, risk `high`),
+non-TTY runs are deny-by-default, and a persistent rule
+(`approvals add --kind code --action bash:<hash>`) pre-approves exactly
+one `(language, script)` pair by SHA-256 hash. Script + output land as
+evidence tagged `coder:<purpose>:<hash8>`; a failing script is still
+information. See [sandbox/README.md](sandbox/README.md).
+
 ### Spawn domain specialists mid-run (opt-in)
 
 ```bash
@@ -453,6 +481,8 @@ to get started.
 | `PODDEBUGGER_LEARN` | `1` enables cross-run experience memory (same as `--learn`) | unset |
 | `PODDEBUGGER_SPECIALISTS` | `1` lets the Coordinator spawn specialist agents (same as `--specialists`) | unset |
 | `PODDEBUGGER_PROMPT_PACK` | prompt-pack directory (same as `--prompt-pack`) | unset (built-ins) |
+| `PODDEBUGGER_ENABLE_CODER` | `1` enables the Coder agent (same as `--coder`) | unset |
+| `PODDEBUGGER_CODER_IMAGE` | sandbox image for Coder scripts | `localhost/poddebugger-coder-sandbox:latest` |
 | `PODDEBUGGER_EXPERIENCE_DIR` | where experience records are stored | `~/.local/share/poddebugger/experience/` |
 | `PODDEBUGGER_REMEDIATION_MODE` | operator default mode | `SuggestOnly` |
 | `PODDEBUGGER_LOG_LINES` | log tail size collected | `200` |

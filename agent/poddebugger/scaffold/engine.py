@@ -32,12 +32,14 @@ from .agents import (
     ActionAgent,
     Agent,
     AgentContext,
+    Coder,
     Librarian,
     Remediator,
     built_in_agents,
     make_specialist,
     specialty_slug,
 )
+from . import sandbox
 from .llms import AgentLLMs
 from .probes import PROBE_MENU, run_probe
 from .search import NoopBackend, SearchBackend, SearchError, get_backend, redact_query
@@ -128,6 +130,8 @@ class InvestigationEngine:
         specialists_enabled: bool = False,
         max_specialists: int = 2,
         prompt_pack: dict | None = None,
+        coder_enabled: bool = False,
+        coder_image: str | None = None,
     ):
         self.provider = provider
         # Accept either a single client (all roles) or a per-role resolver.
@@ -161,6 +165,10 @@ class InvestigationEngine:
         self.specialists_enabled = specialists_enabled
         self.max_specialists = max_specialists
         self._specialists: dict[str, Agent] = {}  # slug -> spawned instance
+        # Stage 13D — sandbox image for Coder scripts.
+        self.coder_enabled = coder_enabled
+        self.coder_image = coder_image
+        self._scripts_run: set[str] = set()  # script hashes (dedup)
         # The Librarian formulates queries; this backend runs them. Default
         # noop keeps the engine air-gap safe (HLD §13.3).
         self.search_backend: SearchBackend = (
@@ -188,6 +196,11 @@ class InvestigationEngine:
         # Coordinator-dispatchable as the ``research`` action.
         if research_enabled:
             self._register(Librarian())
+        # The Coder is opt-in (Stage 13D). Every script it writes still has
+        # to clear the approval gate (which shows the human the full body)
+        # before the sandbox runs it.
+        if coder_enabled:
+            self._register(Coder())
         for agent in (extra_agents or ()):
             self._register(agent)
         for agent in load_agents_from_env():
@@ -394,6 +407,12 @@ class InvestigationEngine:
             self._do_specialist(ctx, target, instruction)
             return
 
+        # Coder needs engine-level follow-up (gate + sandbox execution), so
+        # it must not fall through to the generic ActionAgent dispatch.
+        if action == "code" and "Coder" in self._agents:
+            self._do_code(ctx, instruction)
+            return
+
         # Any other registered ActionAgent: dispatch generically. Its apply()
         # is responsible for recording evidence / dispatch records itself.
         if action in self._action_agents:
@@ -464,6 +483,59 @@ class InvestigationEngine:
             "Librarian", redacted, f"{len(hits)} hits — {hits[0].domain()}",
         )
         self._log(f"librarian: {redacted!r} -> {len(hits)} hits")
+
+    def _do_code(self, ctx, instruction: str) -> None:
+        """Run the Coder, then gate + execute its script in the sandbox
+        (Stage 13D). Modeled on _do_probe/_do_research: the LLM decides
+        WHAT to run; the engine owns the safety boundary — the approval
+        gate sees the full script, and execution happens in a sibling
+        sandbox container, never inside the target."""
+        proposal = self._run("Coder", ctx, instruction=instruction)
+        if not proposal or not isinstance(proposal, dict):
+            return
+        script = (proposal.get("script") or "").strip()
+        if not script:
+            reason = proposal.get("reason") or "Coder declined to write a script"
+            self.state.record_dispatch("Coder", "skip", reason[:80])
+            self._log(f"coder: skipped — {reason}")
+            return
+        language = proposal.get("language") or "bash"
+        purpose = proposal.get("purpose") or "probe"
+        digest = sandbox.script_hash(language, script)
+        if digest in self._scripts_run:
+            self.state.record_dispatch("Coder", digest[:8],
+                                       "skipped — identical script already run")
+            self._log("coder: identical script already run, skipped")
+            return
+        self._scripts_run.add(digest)
+
+        result = sandbox.run_code(
+            self.provider, self._ref, language, script,
+            purpose=purpose, gate=self.gate, image=self.coder_image)
+        if result.denied:
+            self.state.notes.append(
+                f"coder script {digest[:8]} not run: {result.error}")
+            self.state.record_dispatch("Coder", digest[:8],
+                                       f"denied: {result.error[:60]}")
+            self._log(f"coder: {result.error}")
+            return
+        if not result.executed:
+            self.state.add_evidence("coder script could not run",
+                                    detail=result.error, source="coder:error")
+            self.state.record_dispatch("Coder", digest[:8],
+                                       f"failed: {result.error[:60]}")
+            self._log(f"coder: failed — {result.error}")
+            return
+        detail = (f"{language} script (exit {result.exit_code}):\n{script}\n"
+                  f"--- output ---\n{result.output or '(no output)'}")
+        self.state.add_evidence(
+            f"sandbox script result ({language}, {purpose}, "
+            f"exit {result.exit_code})",
+            detail=detail[:sandbox.OUTPUT_CAP + 2000],
+            source=f"coder:{purpose}:{digest[:8]}")
+        self.state.record_dispatch("Coder", digest[:8],
+                                   f"{purpose} exit={result.exit_code}")
+        self._log(f"coder: ran {digest[:8]} ({language}, exit {result.exit_code})")
 
     def _do_specialist(self, ctx, specialty: str, instruction: str) -> None:
         """Spawn (or re-consult) a domain specialist (Phase 15B — HLD §19.3).
@@ -962,6 +1034,7 @@ class InvestigationEngine:
         self._queries_run = set()
         self._signature = None
         self._specialists = {}
+        self._scripts_run = set()
         ctx = collect(self.provider, ref, log_lines=self.log_lines)
 
         state = InvestigationState(target=str(ref), platform=ref.platform)
