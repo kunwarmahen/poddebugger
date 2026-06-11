@@ -147,8 +147,13 @@ spec:
                       description: Catalog action name, or "none" if no action fits.
                     params:
                       type: object
-                      additionalProperties:
-                        type: string
+                      description: >-
+                        Validated action parameters. Values are NOT flat
+                        strings for every action — set-env carries an env
+                        object, recreate carries command/args lists — so the
+                        schema must not constrain value types (live-cluster
+                        validation: a string-typed map rejected the patch).
+                      x-kubernetes-preserve-unknown-fields: true
                     risk:
                       type: string
                     rationale:
@@ -194,6 +199,11 @@ spec:
                           type: string
                         waitedSeconds:
                           type: integer
+                    savedTo:
+                      type: string
+                      description: >-
+                        Path of the reversal payload saved for `remediate
+                        --undo` (on the operator's filesystem).
                 observedTime:
                   type: string
                 message:

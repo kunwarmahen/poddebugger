@@ -739,7 +739,16 @@ def _parse_env_map(raw_env) -> dict:
     """Validate an env map: keys must be shell-legal; values are strings.
 
     A ``null`` value (Python ``None``) marks the key for deletion.
+    Accepts a JSON-object *string* too — the CLI's ``--param env=...`` and
+    the operator's ``spec.remediationParams`` can only deliver strings
+    (found in live-cluster validation; without this, set-env/recreate were
+    unreachable from those surfaces).
     """
+    if isinstance(raw_env, str) and raw_env.strip().startswith("{"):
+        try:
+            raw_env = json.loads(raw_env)
+        except json.JSONDecodeError as exc:
+            raise RemediationError(f"'env' is not valid JSON: {exc}") from exc
     if not isinstance(raw_env, dict) or not raw_env:
         raise RemediationError("'env' must be a non-empty object of KEY: value")
     out: dict = {}
@@ -1040,8 +1049,16 @@ def _parse_recreate(raw: dict) -> dict:
 
 def _as_str_list(value, name: str) -> list:
     if isinstance(value, str):
-        # allow a single string -> one-element list
-        return [value]
+        # a JSON-array string (CLI --param / operator params deliver strings)
+        if value.strip().startswith("["):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise RemediationError(
+                    f"{name} is not valid JSON: {exc}") from exc
+        else:
+            # allow a single string -> one-element list
+            return [value]
     if isinstance(value, list) and all(isinstance(x, (str, int, float)) for x in value):
         return [str(x) for x in value]
     raise RemediationError(f"{name} must be a string or a list of strings")

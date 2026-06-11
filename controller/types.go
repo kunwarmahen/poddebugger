@@ -1,6 +1,9 @@
 package main
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 // CrashEvent is a detected workload failure worth analyzing.
 type CrashEvent struct {
@@ -32,12 +35,12 @@ func (e CrashEvent) Label() string {
 // Diagnosis mirrors the JSON emitted by `poddebugger analyze --json`
 // (the Python Diagnosis dataclass).
 type Diagnosis struct {
-	Summary             string               `json:"summary"`
-	RootCause           string               `json:"root_cause"`
-	Confidence          float64              `json:"confidence"`
-	Evidence            []string             `json:"evidence"`
-	SuggestedFixes      []Fix                `json:"suggested_fixes"`
-	NeedsDeepInspection bool                 `json:"needs_deep_inspection"`
+	Summary             string   `json:"summary"`
+	RootCause           string   `json:"root_cause"`
+	Confidence          float64  `json:"confidence"`
+	Evidence            []string `json:"evidence"`
+	SuggestedFixes      []Fix    `json:"suggested_fixes"`
+	NeedsDeepInspection bool     `json:"needs_deep_inspection"`
 	// ProposedRemediation is set by `analyze --fix` (Phase 7B). The CLI
 	// outputs the snake_case key; the operator stores it on .status as the
 	// camelCase JSON in pdrStatus.ProposedRemediation.
@@ -66,6 +69,75 @@ type ProposedRemediation struct {
 	Validated       bool           `json:"validated,omitempty"`
 	Reason          string         `json:"reason,omitempty"`
 	ValidationError string         `json:"validation_error,omitempty"`
+}
+
+// The analyzer CLI emits snake_case JSON; the CRD's .status convention is
+// camelCase. The three types below therefore decode snake_case (struct
+// tags) but encode camelCase (custom MarshalJSON), so the same value can
+// be read from the CLI and written to .status without a conversion layer.
+// Found in live-cluster validation: without this, the status patch carried
+// expected_effect / saved_to / waited_seconds, which the structural schema
+// pruned (or, for object-valued params, rejected outright).
+
+// MarshalJSON emits the CRD's camelCase field names.
+func (p ProposedRemediation) MarshalJSON() ([]byte, error) {
+	m := map[string]any{"action": p.Action}
+	if len(p.Params) > 0 {
+		m["params"] = p.Params
+	}
+	if p.Risk != "" {
+		m["risk"] = p.Risk
+	}
+	if p.Rationale != "" {
+		m["rationale"] = p.Rationale
+	}
+	if p.ExpectedEffect != "" {
+		m["expectedEffect"] = p.ExpectedEffect
+	}
+	if p.Confidence != 0 {
+		m["confidence"] = p.Confidence
+	}
+	if len(p.Reversal) > 0 {
+		m["reversal"] = p.Reversal
+	}
+	if p.Validated {
+		m["validated"] = true
+	}
+	if p.Reason != "" {
+		m["reason"] = p.Reason
+	}
+	if p.ValidationError != "" {
+		m["validationError"] = p.ValidationError
+	}
+	return json.Marshal(m)
+}
+
+// MarshalJSON emits the CRD's camelCase field names.
+func (r RemediationResult) MarshalJSON() ([]byte, error) {
+	m := map[string]any{
+		"action":   r.Action,
+		"executed": r.Executed,
+		"result":   r.Result,
+	}
+	if r.Verification != nil {
+		m["verification"] = r.Verification
+	}
+	if r.SavedTo != "" {
+		m["savedTo"] = r.SavedTo
+	}
+	return json.Marshal(m)
+}
+
+// MarshalJSON emits the CRD's camelCase field names.
+func (v Verification) MarshalJSON() ([]byte, error) {
+	m := map[string]any{"outcome": v.Outcome}
+	if v.Reason != "" {
+		m["reason"] = v.Reason
+	}
+	if v.WaitedSeconds != 0 {
+		m["waitedSeconds"] = v.WaitedSeconds
+	}
+	return json.Marshal(m)
 }
 
 // --- Phase 12 — PodDebuggerApprovalPolicy ---------------------------------
@@ -128,14 +200,14 @@ type RemediationResult struct {
 }
 
 // Verification mirrors the Phase 7D post-remediation re-check
-// (HLD §12.7). ``Outcome`` is one of: recovered | still-failing | unknown |
+// (HLD §12.7). “Outcome“ is one of: recovered | still-failing | unknown |
 // skipped.
 type Verification struct {
-	Outcome        string         `json:"outcome"`
-	Reason         string         `json:"reason,omitempty"`
-	WaitedSeconds  int            `json:"waited_seconds,omitempty"`
-	Baseline       map[string]any `json:"baseline,omitempty"`
-	Observed       map[string]any `json:"observed,omitempty"`
+	Outcome       string         `json:"outcome"`
+	Reason        string         `json:"reason,omitempty"`
+	WaitedSeconds int            `json:"waited_seconds,omitempty"`
+	Baseline      map[string]any `json:"baseline,omitempty"`
+	Observed      map[string]any `json:"observed,omitempty"`
 }
 
 // Watcher streams crash events into out until the context is cancelled.

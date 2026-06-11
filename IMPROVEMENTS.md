@@ -119,7 +119,12 @@ first.
 
 ## 3. Operational maturity
 
-### 3.1 Live cluster validation (oldest open item)
+### 3.1 Live cluster validation — ✅ done (2026-06-11)
+
+> Status: executed on kind/Podman exactly as planned below; full log in
+> `deploy/VALIDATION.md`. Five bugs found and fixed — the K8s surface is
+> now genuinely exercised. Remaining from this item: in-cluster operator
+> packaging (image + RBAC) and a kind-based CI job.
 Phases 2/4/5/7C/12 are cluster-untested — blocked on "no reachable
 cluster". Unblock with **kind** (Kubernetes-in-Docker runs fine on Podman
 4.x: `KIND_EXPERIMENTAL_PROVIDER=podman kind create cluster`). Then walk

@@ -68,16 +68,17 @@ func RunAnalysis(ctx context.Context, cfg AnalyzerConfig, ev CrashEvent, withFix
 	return raw, &d, nil
 }
 
-// RunRemediation invokes `poddebugger remediate ... --confirm --json` and
-// returns the parsed result. The CLI exits non-zero when the action did not
-// execute; that surfaces here as a non-nil error alongside the result.
-// Each entry in params is appended as `--param key=value` (Phase 7A).
-func RunRemediation(ctx context.Context, cfg AnalyzerConfig, target, namespace, action string, params map[string]string) (RemediationResult, error) {
+// remediationArgs builds the CLI invocation for one remediation.
+// --yes: the operator runs without a TTY, where the Phase 11 approval gate
+// denies by default. The CR *is* the human's durable authorization
+// (AutoRemediate mode / spec.approved=true) — found in live-cluster
+// validation: without it every operator remediation was refused.
+func remediationArgs(target, namespace, action string, params map[string]string) []string {
 	args := []string{
 		"remediate", target,
 		"--platform", "kubernetes",
 		"--action", action,
-		"--confirm", "--json",
+		"--confirm", "--yes", "--json",
 	}
 	if namespace != "" {
 		args = append(args, "-n", namespace)
@@ -91,6 +92,15 @@ func RunRemediation(ctx context.Context, cfg AnalyzerConfig, target, namespace, 
 	for _, k := range keys {
 		args = append(args, "--param", fmt.Sprintf("%s=%s", k, params[k]))
 	}
+	return args
+}
+
+// RunRemediation invokes `poddebugger remediate ... --confirm --json` and
+// returns the parsed result. The CLI exits non-zero when the action did not
+// execute; that surfaces here as a non-nil error alongside the result.
+// Each entry in params is appended as `--param key=value` (Phase 7A).
+func RunRemediation(ctx context.Context, cfg AnalyzerConfig, target, namespace, action string, params map[string]string) (RemediationResult, error) {
+	args := remediationArgs(target, namespace, action, params)
 
 	cctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
