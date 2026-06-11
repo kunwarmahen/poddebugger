@@ -437,6 +437,25 @@ it (strips IPs, UUIDs, hex IDs, pod-suffix patterns) before any HTTP
 request, then runs it through the backend. Hits land in the investigation
 as Evidence tagged `web:<domain>` — leads, not authority.
 
+### Spawn a domain specialist mid-run
+
+With `--specialists`, the Coordinator can decide the team needs an expert
+it doesn't have — and create one on the spot, writing the new agent's
+charter itself:
+
+```bash
+poddebugger analyze pd-pg --platform podman --specialists --verbose
+# [scaffold] coordinator: specialist PostgreSQL crash analysis
+# [scaffold] specialist spawned: Specialist:postgresql-crash-analysis (1/2)
+```
+
+Specialists are advisory only (evidence and leads tagged
+`dynamic:<slug>`, no probes/actions), budgeted at 2 unique specialties
+per run, and every generated system prompt is saved to
+`specialists/<slug>.md` in the run workspace so you can audit exactly
+what the spawned agent was told. Set `PODDEBUGGER_SPECIALISTS=1` to make
+it the default.
+
 ### Remember what worked (cross-run learning)
 
 With `--learn`, a verified fix outcome — recovered or honestly not — is

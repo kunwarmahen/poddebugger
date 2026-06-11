@@ -54,6 +54,12 @@ example](examples/log_investigator/) is included).
   via a `SearchBackend` (DuckDuckGo ships; ABC is pluggable). Queries
   are redacted (IPs, UUIDs, pod-suffix patterns) before they leave the
   host. Off by default — air-gap safe.
+- **Spawns specialists on the fly (opt-in).** With `--specialists`, the
+  Coordinator can mid-run conjure a domain expert — "PostgreSQL crash
+  analysis", "JVM heap tuning" — writing its charter itself; the charter
+  becomes the new agent's system prompt (the LLM prompting the next LLM
+  call). Specialists are advisory only and budgeted per run; every
+  generated prompt is committed to the run workspace for audit.
 - **Learns from past incidents (opt-in).** With `--learn`, verified
   remediation outcomes are remembered (redacted, local JSON); on later
   runs a Historian step recalls similar past incidents — including
@@ -283,6 +289,23 @@ issuing it. Results land as evidence tagged `web:<domain>` — leads, not
 authority. The default backend is `noop` (air-gap safe). Plug your own
 with `PODDEBUGGER_SEARCH_BACKEND=mypkg.mymod.MyBackend`.
 
+### Spawn domain specialists mid-run (opt-in)
+
+```bash
+poddebugger analyze my-broken-container --specialists
+```
+
+When enabled, the Coordinator's menu gains a `specialist` action: it names
+a specialty ("PostgreSQL crash analysis") and writes the charter, and the
+engine composes a new agent's system prompt from both — dynamic prompting,
+on the fly. Specialists are **advisory only**: ordinary agents whose output
+lands as evidence and leads tagged `dynamic:<slug>` — they cannot probe,
+act, or touch the remediation catalog, so enabling them adds no new
+capabilities. Budget: 2 unique specialties per run (re-consulting one is
+free). Every composed prompt is persisted to `specialists/<slug>.md` inside
+the run workspace and captured by the per-iteration git commit, so runs
+stay replayable and auditable.
+
 ### Learn from past incidents (opt-in)
 
 ```bash
@@ -391,6 +414,7 @@ to get started.
 | `PODDEBUGGER_APPROVALS_FILE` | path to the persistent approval rules | `$XDG_CONFIG_HOME/poddebugger/approvals.json` |
 | `PODDEBUGGER_ALLOW_SHELL` | `1` enables the freeform `shell` catalog action | unset |
 | `PODDEBUGGER_LEARN` | `1` enables cross-run experience memory (same as `--learn`) | unset |
+| `PODDEBUGGER_SPECIALISTS` | `1` lets the Coordinator spawn specialist agents (same as `--specialists`) | unset |
 | `PODDEBUGGER_EXPERIENCE_DIR` | where experience records are stored | `~/.local/share/poddebugger/experience/` |
 | `PODDEBUGGER_REMEDIATION_MODE` | operator default mode | `SuggestOnly` |
 | `PODDEBUGGER_LOG_LINES` | log tail size collected | `200` |

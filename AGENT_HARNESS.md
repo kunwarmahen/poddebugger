@@ -306,6 +306,18 @@ built — they're listed here so you know what's on the menu.
   option (`pip install 'poddebugger[search]'`); the `SearchBackend` ABC
   is pluggable. (Design: [HLD.md §13](HLD.md).)
 
+- **Specialists** ("experts hired for one case"). With `analyze
+  --specialists`, the Coordinator can notice mid-investigation that the
+  team lacks a skill — say, deep PostgreSQL knowledge — and *create* that
+  expert on the spot: it names the specialty and writes the new agent's
+  marching orders itself, and that text becomes the spawned agent's
+  system prompt. Specialists only read and advise — their insights land
+  as evidence tagged `dynamic:<name>`, and they can never run commands
+  or change anything, so the team gains expertise without gaining
+  permissions. At most two are hired per run, and every generated
+  prompt is saved in the run's audit trail so you can see exactly what
+  the expert was told. (Design: [HLD.md §19.3](HLD.md).)
+
 - **The Historian** ("the one who remembers"). With `analyze --learn`,
   the team stops starting from scratch: after a fix is verified (it
   worked — or it honestly didn't), a redacted record of the incident is

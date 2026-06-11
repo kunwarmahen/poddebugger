@@ -25,6 +25,7 @@ from .prober import Prober
 from .remediator import Remediator
 from .reporter import Reporter
 from .scout import Scout
+from .specialist import Specialist, make_specialist, specialty_slug
 from .verifier import Verifier
 
 
@@ -63,5 +64,8 @@ __all__ = [
     "Reporter",
     "Remediator",
     "Librarian",
+    "Specialist",
+    "make_specialist",
+    "specialty_slug",
     "built_in_agents",
 ]

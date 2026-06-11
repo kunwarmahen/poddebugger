@@ -51,6 +51,10 @@ class Config:
     # Phase 15A — cross-run experience memory. Off by default: recall and
     # recording only happen with ``analyze --learn`` or PODDEBUGGER_LEARN=1.
     learn: bool = False
+    # Phase 15B — on-the-fly specialist agents. Off by default: the
+    # Coordinator only gets the `specialist` menu action with
+    # ``analyze --specialists`` or PODDEBUGGER_SPECIALISTS=1.
+    specialists: bool = False
     env_file: str = ""           # path of the .env that was loaded, if any
 
     @property
@@ -72,6 +76,7 @@ class Config:
             search_backend=os.environ.get("PODDEBUGGER_SEARCH_BACKEND", "noop"),
             approvals_mode=os.environ.get("PODDEBUGGER_APPROVALS_MODE", "session"),
             learn=os.environ.get("PODDEBUGGER_LEARN", "") == "1",
+            specialists=os.environ.get("PODDEBUGGER_SPECIALISTS", "") == "1",
         )
 
 

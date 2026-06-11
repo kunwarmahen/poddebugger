@@ -167,6 +167,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             context=_parse_context(args.context),
             max_remediation_attempts=args.max_attempts,
             learning_enabled=bool(args.learn or cfg.learn),
+            specialists_enabled=bool(args.specialists or cfg.specialists),
         )
         diagnosis = engine.investigate(ref)
     except (LLMError, ProviderError) as exc:
@@ -558,6 +559,14 @@ def build_parser() -> argparse.ArgumentParser:
              "past incidents as evidence, and record this run's verified "
              "remediation outcome. Equivalent to PODDEBUGGER_LEARN=1. "
              "Inspect the store with `poddebugger experience list`.",
+    )
+    a.add_argument(
+        "--specialists",
+        action="store_true",
+        help="let the Coordinator spawn domain-specialist agents mid-run "
+             "(advisory only — they read evidence, never act). Budgeted at "
+             "2 unique specialties per run; generated prompts are saved to "
+             "the run workspace. Equivalent to PODDEBUGGER_SPECIALISTS=1.",
     )
     a.add_argument(
         "--research",

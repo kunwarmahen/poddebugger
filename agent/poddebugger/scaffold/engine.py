@@ -35,6 +35,8 @@ from .agents import (
     Librarian,
     Remediator,
     built_in_agents,
+    make_specialist,
+    specialty_slug,
 )
 from .llms import AgentLLMs
 from .probes import PROBE_MENU, run_probe
@@ -123,6 +125,8 @@ class InvestigationEngine:
         max_remediation_attempts: int = 3,
         learning_enabled: bool = False,
         experience_store=None,
+        specialists_enabled: bool = False,
+        max_specialists: int = 2,
     ):
         self.provider = provider
         # Accept either a single client (all roles) or a per-role resolver.
@@ -149,6 +153,13 @@ class InvestigationEngine:
             from ..experience import ExperienceStore
 
             self._exp_store = ExperienceStore()
+        # Phase 15B — on-the-fly specialist agents. A Specialist is advisory
+        # only (ordinary Agent, no probes/actions), so enabling this adds no
+        # new capabilities — just dynamically composed prompts, budgeted per
+        # run and persisted to the workspace for audit.
+        self.specialists_enabled = specialists_enabled
+        self.max_specialists = max_specialists
+        self._specialists: dict[str, Agent] = {}  # slug -> spawned instance
         # The Librarian formulates queries; this backend runs them. Default
         # noop keeps the engine air-gap safe (HLD §13.3).
         self.search_backend: SearchBackend = (
@@ -204,7 +215,15 @@ class InvestigationEngine:
     def _action_menu(self) -> list[tuple[str, str]]:
         """The Coordinator's dynamic action menu — every registered
         ActionAgent contributes one ``(action_name, description)`` entry."""
-        return [(a.action_name, a.description) for a in self._action_agents.values()]
+        menu = [(a.action_name, a.description) for a in self._action_agents.values()]
+        if self.specialists_enabled:
+            menu.append((
+                "specialist",
+                "consult a domain specialist (advisory only): put the "
+                'specialty in "target" (e.g. "PostgreSQL crash analysis") '
+                'and write its charter/question in "instruction"',
+            ))
+        return menu
 
     # --- helpers ------------------------------------------------------------
 
@@ -362,6 +381,10 @@ class InvestigationEngine:
             self._do_research(ctx, instruction)
             return
 
+        if action == "specialist" and self.specialists_enabled:
+            self._do_specialist(ctx, target, instruction)
+            return
+
         # Any other registered ActionAgent: dispatch generically. Its apply()
         # is responsible for recording evidence / dispatch records itself.
         if action in self._action_agents:
@@ -432,6 +455,60 @@ class InvestigationEngine:
             "Librarian", redacted, f"{len(hits)} hits — {hits[0].domain()}",
         )
         self._log(f"librarian: {redacted!r} -> {len(hits)} hits")
+
+    def _do_specialist(self, ctx, specialty: str, instruction: str) -> None:
+        """Spawn (or re-consult) a domain specialist (Phase 15B — HLD §19.3).
+
+        The Coordinator names the specialty (``target``) and writes the
+        charter (``instruction``); both are composed into the new agent's
+        system prompt. Budgeted per run; re-consulting an existing
+        specialist is free. The composed prompt is persisted to the run
+        workspace so the spawn is auditable and the run replayable.
+        """
+        specialty = (specialty or "").strip()
+        if not specialty:
+            self.state.record_dispatch("Specialist", "skip",
+                                       "no specialty named in target")
+            self._log("specialist: skipped — no specialty in target")
+            return
+        slug = specialty_slug(specialty)
+        agent = self._specialists.get(slug)
+        if agent is None:
+            if len(self._specialists) >= self.max_specialists:
+                self.state.notes.append(
+                    f"specialist budget ({self.max_specialists}) exhausted — "
+                    f"not spawning {specialty!r}"
+                )
+                self.state.record_dispatch("Specialist", "skip",
+                                           f"budget exhausted: {specialty[:60]}")
+                self._log(f"specialist: budget exhausted, not spawning {slug}")
+                return
+            try:
+                agent = make_specialist(specialty, charter=instruction)
+            except ValueError as exc:
+                self.state.record_dispatch("Specialist", "skip", str(exc)[:80])
+                self._log(f"specialist: {exc}")
+                return
+            self._specialists[slug] = agent
+            self._register(agent)
+            self._persist_specialist_prompt(agent)
+            self._log(f"specialist spawned: {agent.name} "
+                      f"({len(self._specialists)}/{self.max_specialists})")
+        else:
+            self._log(f"specialist: re-consulting {agent.name}")
+        self._run(agent.name, ctx, instruction=instruction)
+
+    def _persist_specialist_prompt(self, agent) -> None:
+        """Write the composed prompt into the workspace; the next iteration
+        commit (`git add -A`) captures it. Best-effort."""
+        if self.workspace is None:
+            return
+        try:
+            sub = self.workspace.path / "specialists"
+            sub.mkdir(parents=True, exist_ok=True)
+            (sub / f"{agent.slug}.md").write_text(agent.prompt_document())
+        except OSError as exc:
+            self.state.notes.append(f"could not persist specialist prompt: {exc}")
 
     def _run_audit_chain(self, ctx) -> None:
         """Auditor sweep, then route each finding-critique to the Adjudicator."""
@@ -875,6 +952,7 @@ class InvestigationEngine:
         self._probes_run = set()
         self._queries_run = set()
         self._signature = None
+        self._specialists = {}
         ctx = collect(self.provider, ref, log_lines=self.log_lines)
 
         state = InvestigationState(target=str(ref), platform=ref.platform)
