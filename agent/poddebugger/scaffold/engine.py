@@ -121,6 +121,8 @@ class InvestigationEngine:
         gate=None,
         context: dict | None = None,
         max_remediation_attempts: int = 3,
+        learning_enabled: bool = False,
+        experience_store=None,
     ):
         self.provider = provider
         # Accept either a single client (all roles) or a per-role resolver.
@@ -137,6 +139,16 @@ class InvestigationEngine:
         self.context: dict = dict(context or {})
         # Phase 13A — cap on how many fixes the loop will try before giving up.
         self.max_remediation_attempts = max_remediation_attempts
+        # Phase 15A — cross-run experience memory. Recalled records are prompt
+        # context only; the catalog + gate stay the capability boundary.
+        # Imported lazily: experience pulls in scaffold.search, and this module
+        # is imported during the scaffold package's own initialization.
+        self.learning_enabled = learning_enabled
+        self._exp_store = experience_store
+        if learning_enabled and self._exp_store is None:
+            from ..experience import ExperienceStore
+
+            self._exp_store = ExperienceStore()
         # The Librarian formulates queries; this backend runs them. Default
         # noop keeps the engine air-gap safe (HLD §13.3).
         self.search_backend: SearchBackend = (
@@ -176,6 +188,10 @@ class InvestigationEngine:
         self._ref: WorkloadRef | None = None
         self._probes_run: set[str] = set()
         self._queries_run: set[str] = set()
+        # Phase 15A — the failure signature captured at investigate() time,
+        # BEFORE any fix mutates the workload (a post-recovery collect would
+        # describe a healthy container).
+        self._signature: dict | None = None
 
     # --- registry -----------------------------------------------------------
 
@@ -627,6 +643,17 @@ class InvestigationEngine:
     def remediate(self, diagnosis: Diagnosis, *, apply: bool = False,
                   max_risk: str = "low",
                   verify_wait: int = remediation.DEFAULT_VERIFY_WAIT) -> dict:
+        """Drive the remediation loop, then (Phase 15A) record the verified
+        outcome to the experience store when learning is enabled."""
+        result = self._remediate_loop(diagnosis, apply=apply,
+                                      max_risk=max_risk, verify_wait=verify_wait)
+        if apply and self.learning_enabled and self._exp_store is not None:
+            self._record_experience(diagnosis, result)
+        return result
+
+    def _remediate_loop(self, diagnosis: Diagnosis, *, apply: bool = False,
+                        max_risk: str = "low",
+                        verify_wait: int = remediation.DEFAULT_VERIFY_WAIT) -> dict:
         """Drive the full propose → apply → verify → replan loop (Phase 13A).
 
         With ``apply=False`` this proposes a single fix and stops (the
@@ -728,6 +755,68 @@ class InvestigationEngine:
         return {"outcome": "unresolved", "attempts": attempts,
                 "final_proposal": last_proposal}
 
+    # --- cross-run experience memory (Phase 15A) -----------------------------
+
+    def _recall_experience(self, ctx) -> None:
+        """Land the most similar past incidents as Evidence. Best-effort —
+        a broken store degrades to a note, never fails the run."""
+        from .. import experience
+
+        try:
+            self._signature = experience.signature_from_context(
+                ctx, self.state.classification)
+            matches = self._exp_store.find_similar(self._signature)
+        except Exception as exc:  # noqa: BLE001 — the store is non-critical
+            self.state.notes.append(f"experience recall failed: {exc}")
+            self._log(f"historian: recall failed — {exc}")
+            return
+        for rec, _score in matches:
+            self.state.add_evidence(rec.recall_summary(),
+                                    detail=rec.recall_detail(),
+                                    source=f"experience:{rec.id}")
+        self.state.record_dispatch("Historian", "recall",
+                                   f"{len(matches)} similar past incidents")
+        self._log(f"historian: recalled {len(matches)} past incidents")
+        if matches:
+            self._commit(f"historian: recalled {len(matches)} past incidents")
+
+    def _record_experience(self, diagnosis: Diagnosis, result: dict) -> None:
+        """Persist a verified remediation outcome. Only `resolved` and
+        `unresolved` carry information worth remembering."""
+        from .. import experience
+
+        outcome = result.get("outcome")
+        if outcome not in ("resolved", "unresolved"):
+            return
+        try:
+            sig = self._signature
+            if sig is None:
+                # Standalone remediate() call — collect now. Less faithful
+                # (a resolved workload reads healthy) but better than nothing.
+                ctx = collect(self.provider, self._ref, log_lines=self.log_lines)
+                sig = experience.signature_from_context(
+                    ctx, self.state.classification if self.state else "")
+            attempts = [{
+                "action": a["proposal"].get("action"),
+                "params": a["proposal"].get("params"),
+                "outcome": ((a.get("applied") or {}).get("verification") or {}
+                            ).get("outcome", "applied"),
+            } for a in result.get("attempts") or []]
+            rec = experience.make_record(
+                sig, summary=diagnosis.summary, root_cause=diagnosis.root_cause,
+                attempts=attempts,
+                outcome="recovered" if outcome == "resolved" else "unresolved")
+            saved = self._exp_store.save(rec)
+        except Exception as exc:  # noqa: BLE001 — the store is non-critical
+            if self.state is not None:
+                self.state.notes.append(f"experience record failed: {exc}")
+            self._log(f"historian: record failed — {exc}")
+            return
+        if saved:
+            if self.state is not None:
+                self.state.record_dispatch("Historian", "record", rec.id)
+            self._log(f"historian: recorded {rec.id} ({rec.outcome}) -> {saved}")
+
     def _record_failed_fix(self, proposal: dict, verification: dict) -> None:
         outcome = verification.get("outcome", "unknown")
         reason = verification.get("reason", "")
@@ -785,6 +874,7 @@ class InvestigationEngine:
         self._calls = 0
         self._probes_run = set()
         self._queries_run = set()
+        self._signature = None
         ctx = collect(self.provider, ref, log_lines=self.log_lines)
 
         state = InvestigationState(target=str(ref), platform=ref.platform)
@@ -809,6 +899,12 @@ class InvestigationEngine:
             self._log(f"scout: {state.classification}, "
                       f"{len(state.leads)} leads, {len(state.evidence)} evidence")
         self._commit("scout: classify and seed leads")
+
+        # Historian (Phase 15A, opt-in): now that the Scout has classified,
+        # the signature is known — recall similar past incidents so the
+        # Planner and the loop start from prior experience.
+        if self.learning_enabled and self._exp_store is not None:
+            self._recall_experience(ctx)
 
         # Planner.
         if self._run("Planner", ctx) is not None:

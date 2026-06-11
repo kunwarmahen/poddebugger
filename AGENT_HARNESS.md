@@ -306,6 +306,19 @@ built — they're listed here so you know what's on the menu.
   option (`pip install 'poddebugger[search]'`); the `SearchBackend` ABC
   is pluggable. (Design: [HLD.md §13](HLD.md).)
 
+- **The Historian** ("the one who remembers"). With `analyze --learn`,
+  the team stops starting from scratch: after a fix is verified (it
+  worked — or it honestly didn't), a redacted record of the incident is
+  kept on your machine. Next time a similar failure shows up, the
+  Historian lays those past incidents on the table as evidence — "we
+  tried a restart on this exact signature last month and it did NOT
+  help; raising the memory limit did". It costs no extra AI calls
+  (matching is plain scoring, not a model), secrets are masked before
+  anything is written, and remembering never changes what the team is
+  *allowed* to do — only what it knows. Inspect or wipe the memory with
+  `poddebugger experience list|clear`. (Design: [HLD.md §19](HLD.md).
+  Runnable demo: [examples/learning_demo.py](examples/learning_demo.py).)
+
 - **An open team — bring your own teammate.** Every existing agent is a
   subclass of a small `Agent` base class, and you can drop your own in
   alongside them: a Metrics agent that pulls Prometheus data, a Runbook

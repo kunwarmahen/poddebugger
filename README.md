@@ -54,6 +54,12 @@ example](examples/log_investigator/) is included).
   via a `SearchBackend` (DuckDuckGo ships; ABC is pluggable). Queries
   are redacted (IPs, UUIDs, pod-suffix patterns) before they leave the
   host. Off by default — air-gap safe.
+- **Learns from past incidents (opt-in).** With `--learn`, verified
+  remediation outcomes are remembered (redacted, local JSON); on later
+  runs a Historian step recalls similar past incidents — including
+  fixes that did NOT work — so the team starts from experience instead
+  of a blank slate. Learning only changes what the LLM is *told*, never
+  what it is *allowed* to do.
 
 ---
 
@@ -277,6 +283,31 @@ issuing it. Results land as evidence tagged `web:<domain>` — leads, not
 authority. The default backend is `noop` (air-gap safe). Plug your own
 with `PODDEBUGGER_SEARCH_BACKEND=mypkg.mymod.MyBackend`.
 
+### Learn from past incidents (opt-in)
+
+```bash
+# Recall similar past incidents AND record this run's verified outcome
+poddebugger analyze my-broken-container --fix --confirm --learn
+
+# Inspect / reset what has been remembered
+poddebugger experience list
+poddebugger experience clear
+```
+
+After a `--fix --confirm` run reaches a verified outcome (recovered or
+honestly not), a redacted experience record — failure signature, what was
+tried, whether it worked — is saved under
+`~/.local/share/poddebugger/experience/` (override with
+`PODDEBUGGER_EXPERIENCE_DIR`). On the next `--learn` run, the most similar
+records land as evidence tagged `experience:<id>` right after the Scout
+classifies, so the Planner and Remediator see "we've seen this before —
+restart didn't help, set-env did". Similarity is deterministic scoring
+(classification, exit code, OOM flag, image, keyword overlap) — no extra
+LLM calls. Secret-looking values are masked and identifiers scrubbed
+*before* anything reaches disk. Recalled records are prompt context only:
+the catalog validator and the approval gate remain the only capability
+boundary.
+
 ---
 
 ## Crash watcher
@@ -359,6 +390,8 @@ to get started.
 | `PODDEBUGGER_APPROVALS_MODE` | `session` \| `persistent` \| `off` | `session` |
 | `PODDEBUGGER_APPROVALS_FILE` | path to the persistent approval rules | `$XDG_CONFIG_HOME/poddebugger/approvals.json` |
 | `PODDEBUGGER_ALLOW_SHELL` | `1` enables the freeform `shell` catalog action | unset |
+| `PODDEBUGGER_LEARN` | `1` enables cross-run experience memory (same as `--learn`) | unset |
+| `PODDEBUGGER_EXPERIENCE_DIR` | where experience records are stored | `~/.local/share/poddebugger/experience/` |
 | `PODDEBUGGER_REMEDIATION_MODE` | operator default mode | `SuggestOnly` |
 | `PODDEBUGGER_LOG_LINES` | log tail size collected | `200` |
 | `PODDEBUGGER_ENV_FILE` | explicit path to a `.env` file | (auto-discovered) |

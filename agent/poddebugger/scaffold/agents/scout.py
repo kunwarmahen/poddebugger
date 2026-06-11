@@ -34,3 +34,6 @@ class Scout(Agent):
         for lead in response.get("leads", []) or []:
             ac.add_lead(str(lead), source="scout")
         ac.record_dispatch("Scout", "classify", ac.state.classification)
+        # The engine reads `None` as "the call failed" — return the parsed
+        # response so a successful Scout is not mistaken for a dead one.
+        return response

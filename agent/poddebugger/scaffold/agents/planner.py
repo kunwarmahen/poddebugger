@@ -37,3 +37,6 @@ class Planner(Agent):
             ac.state.add_sanity_check(str(sc))
         ac.record_dispatch("Planner", "plan",
                            f"{len(ac.state.sanity_checks)} sanity checks")
+        # The engine reads `None` as "the call failed" — return the parsed
+        # response so a successful Planner is not mistaken for a dead one.
+        return response

@@ -48,6 +48,9 @@ class Config:
     # remembers in-memory; ``persistent`` also offers [P]ersist to save a
     # rule; ``off`` ignores the rules file entirely. (HLD §16.5)
     approvals_mode: str = "session"
+    # Phase 15A — cross-run experience memory. Off by default: recall and
+    # recording only happen with ``analyze --learn`` or PODDEBUGGER_LEARN=1.
+    learn: bool = False
     env_file: str = ""           # path of the .env that was loaded, if any
 
     @property
@@ -68,6 +71,7 @@ class Config:
             remediation_mode=os.environ.get("PODDEBUGGER_REMEDIATION_MODE", "SuggestOnly"),
             search_backend=os.environ.get("PODDEBUGGER_SEARCH_BACKEND", "noop"),
             approvals_mode=os.environ.get("PODDEBUGGER_APPROVALS_MODE", "session"),
+            learn=os.environ.get("PODDEBUGGER_LEARN", "") == "1",
         )
 
 

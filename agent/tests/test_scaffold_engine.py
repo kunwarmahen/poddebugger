@@ -138,6 +138,11 @@ class HappyPathTest(unittest.TestCase):
 
         self.assertIn("db:5432", diag.root_cause)
         self.assertEqual(diag.confidence, 0.9)
+        # regression (found in Phase 15A): a successful Scout's classification
+        # must survive — it used to be clobbered to "Unknown" because apply()
+        # returned None and the engine read None as a failed call.
+        self.assertEqual(eng.state.classification, "CrashLoopBackOff")
+        self.assertFalse(any(l.source == "fallback" for l in eng.state.leads))
         # lifecycle: one hypothesis got promoted to a finding
         self.assertEqual(len(eng.state.confirmed_findings), 1)
         self.assertEqual(eng.state.hypotheses, [])

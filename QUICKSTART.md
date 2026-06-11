@@ -437,6 +437,30 @@ it (strips IPs, UUIDs, hex IDs, pod-suffix patterns) before any HTTP
 request, then runs it through the backend. Hits land in the investigation
 as Evidence tagged `web:<domain>` — leads, not authority.
 
+### Remember what worked (cross-run learning)
+
+With `--learn`, a verified fix outcome — recovered or honestly not — is
+remembered locally (redacted: secrets masked, IPs/IDs scrubbed). On the
+next similar failure, past incidents land as evidence right after the
+Scout classifies, steering the team away from fixes that already failed.
+
+```bash
+# First incident: investigate, fix, remember the verified outcome
+poddebugger analyze pd-oom --platform podman --fix --confirm --learn --yes
+
+# Later, a similar failure: recall fires automatically with --learn
+poddebugger analyze pd-oom-2 --platform podman --fix --learn
+
+# What has been remembered / start over
+poddebugger experience list
+poddebugger experience clear
+```
+
+Matching is deterministic scoring (classification, exit code, OOM flag,
+image, keywords) — no extra LLM calls. Recalled records only inform the
+prompts; the catalog validator and approval gate still decide what may
+run. Set `PODDEBUGGER_LEARN=1` to make it the default.
+
 ### Approve before acting
 
 Every mutating step — catalog actions and deep-inspection probes — is

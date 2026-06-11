@@ -166,6 +166,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             gate=analyze_gate,
             context=_parse_context(args.context),
             max_remediation_attempts=args.max_attempts,
+            learning_enabled=bool(args.learn or cfg.learn),
         )
         diagnosis = engine.investigate(ref)
     except (LLMError, ProviderError) as exc:
@@ -551,6 +552,14 @@ def build_parser() -> argparse.ArgumentParser:
              "invoke it directly. Equivalent to setting PODDEBUGGER_ALLOW_SHELL=1.",
     )
     a.add_argument(
+        "--learn",
+        action="store_true",
+        help="enable cross-run experience memory (Phase 15A) — recall similar "
+             "past incidents as evidence, and record this run's verified "
+             "remediation outcome. Equivalent to PODDEBUGGER_LEARN=1. "
+             "Inspect the store with `poddebugger experience list`.",
+    )
+    a.add_argument(
         "--research",
         action="store_true",
         help="enable the Librarian agent — the Coordinator may dispatch a "
@@ -632,6 +641,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.set_defaults(func=_cmd_remediate)
 
     _build_approvals_parser(sub)
+    _build_experience_parser(sub)
 
     return parser
 
@@ -768,6 +778,51 @@ def _build_approvals_parser(sub) -> None:
     ap_chk.add_argument("--target-name", default="")
     ap_chk.add_argument("--target-namespace", default=None)
     ap_chk.set_defaults(func=_cmd_approvals_check)
+
+
+def _cmd_experience_list(args: argparse.Namespace) -> int:
+    from .experience import ExperienceStore
+
+    store = ExperienceStore()
+    records = store.load_all()
+    if args.json:
+        print(json.dumps({"path": str(store.path),
+                          "records": [r.to_dict() for r in records]}, indent=2))
+        return 0
+    if not records:
+        print(f"(no experience records — {store.path})")
+        return 0
+    print(f"# {store.path}")
+    for r in records:
+        tried = ", ".join(a.get("action") or "?" for a in r.attempts) or "-"
+        print(f"  {r.created}  {r.id}  [{r.platform}/{r.classification or '?'}] "
+              f"{r.outcome:10}  tried: {tried}  — {r.root_cause[:60]}")
+    return 0
+
+
+def _cmd_experience_clear(args: argparse.Namespace) -> int:
+    from .experience import ExperienceStore
+
+    store = ExperienceStore()
+    removed = store.clear()
+    print(f"removed {removed} record(s) from {store.path}")
+    return 0
+
+
+def _build_experience_parser(sub) -> None:
+    """`poddebugger experience list/clear` — Phase 15A."""
+    ex = sub.add_parser(
+        "experience",
+        help="inspect the cross-run experience store used by `analyze --learn`",
+    )
+    ex_sub = ex.add_subparsers(dest="experience_cmd", required=True)
+
+    ex_list = ex_sub.add_parser("list", help="show remembered incidents")
+    ex_list.add_argument("--json", action="store_true")
+    ex_list.set_defaults(func=_cmd_experience_list)
+
+    ex_clear = ex_sub.add_parser("clear", help="delete every remembered incident")
+    ex_clear.set_defaults(func=_cmd_experience_clear)
 
 
 def _add_approval_flags(parser: argparse.ArgumentParser) -> None:
